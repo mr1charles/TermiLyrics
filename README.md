@@ -9,11 +9,13 @@ git clone https://github.com/mr1charles/TermiLyrics.git
 cd TermiLyrics
 python -m venv .venv
 source .venv/bin/activate  # Or activate.fish for Fish shell
-pip install -r requirements.txt
+pip install -e .
 \`\`\`
 
 ## 💻 Usage
 
+Simply run the application shortcut from anywhere inside your environment:
+
 \`\`\`bash
-python -m lyrics_sync.main
+termilyrics
 \`\`\`
