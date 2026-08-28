@@ -1,0 +1,16 @@
+# Required for lyric fetching (Problem 3/9 — this was already a dependency).
+syncedlyrics>=0.7
+
+# Required for the Unicode raster font fallback (Problem 4) — without it the
+# app still runs, it just can't display scripts outside the static table.
+Pillow>=10.0
+
+# Optional: lets you drop .yaml font packs into the fonts/ dir, not just .json.
+PyYAML>=6.0
+
+# Optional: enables transcript-based alignment repair (Problem 2).
+youtube-transcript-api>=0.6
+
+# Optional, local-only: embedding-based alignment assist (Problem 8).
+# Heavy (~500MB w/ torch) — only install if you actually want this.
+# sentence-transformers>=2.2
