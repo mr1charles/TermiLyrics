@@ -15,5 +15,8 @@ dependencies = [
     "youtube-transcript-api>=0.6"
 ]
 
+[tool.setuptools]
+packages = ["lyrics_sync"]
+
 [project.scripts]
 termilyrics = "lyrics_sync.main:main"
