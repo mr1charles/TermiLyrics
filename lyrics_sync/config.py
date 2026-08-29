@@ -39,6 +39,22 @@ class RenderConfig:
     typing_effect: bool = False
     typing_chars_per_second: float = 20.0
 
+    # Layout: one of renderer.py's DISPLAY_* constants. Purely a layout/
+    # framing choice — independent of `theme` below, so e.g. hacker-matrix
+    # framing with a different color theme is a valid combination.
+    display_mode: str = "minimalist"
+
+    # Color: one of the keys in renderer.THEMES. Only takes effect when
+    # gradient=True and rainbow=False — rainbow still wins if both are
+    # on, same precedence as before this was added.
+    theme: str = "classic_mono"
+
+    # Opt-in legibility feature, NOT a rendering necessity — fonts.py's
+    # RasterUnicodeFont already renders any script correctly via Pillow.
+    # This is for people who'd rather see "Konnichiwa" than kanji they
+    # can't read. See languages.py.
+    romanize: bool = False
+
 
 @dataclass(frozen=True)
 class Paths:

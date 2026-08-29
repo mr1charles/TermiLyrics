@@ -14,3 +14,13 @@ youtube-transcript-api>=0.6
 # Optional, local-only: embedding-based alignment assist (Problem 8).
 # Heavy (~500MB w/ torch) — only install if you actually want this.
 # sentence-transformers>=2.2
+
+# Optional: /languages.py romanization backends. Every one of these degrades
+# gracefully if missing — see languages.py's HAVE_* flags. Install only the
+# ones for scripts you actually care about; none are required to run the app.
+pykakasi>=2.2          # Japanese (Hiragana/Katakana/Kanji) -> Hepburn romaji
+pypinyin>=0.50          # Chinese (Hanzi) -> Pinyin
+korean-romanizer>=0.9   # Korean (Hangul) -> Revised Romanization
+Unidecode>=1.3          # Cyrillic/Greek/Arabic/Hebrew/Devanagari + better
+                         # Latin-diacritic stripping than the stdlib-only
+                         # NFKD fallback languages.py uses when this is absent

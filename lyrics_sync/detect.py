@@ -151,6 +151,11 @@ def _strip_noise(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip(" -–|")
 
 
+# Public alias — lyrics.py's fallback search chain reuses this exact
+# cleaner rather than re-implementing noise-tag stripping a second time.
+strip_noise_tags = _strip_noise
+
+
 def _strip_browser_chrome(text: str) -> str:
     return _TAB_COUNT.sub("", _BROWSER_CHROME.sub("", text)).strip()
 

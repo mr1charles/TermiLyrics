@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from .cache import TextCache
-from .detect import Song
+from .detect import Song, strip_noise_tags
 
 log = logging.getLogger(__name__)
 
@@ -68,18 +68,45 @@ class LyricsService:
         return parse_lrc(text)
 
     def _scrape(self, song: Song) -> str:
-        # A low-confidence artist (guessed from an ambiguous browser-tab
-        # title, possibly the uploader/channel name) does more harm than
-        # good in a fuzzy-match query — drop it and search by title alone.
-        if song.artist_confidence == "low":
-            query = song.title.strip()
-        else:
-            query = f"{song.title} {song.artist}".strip()
-        try:
-            return syncedlyrics.search(query, providers=self.providers) or ""
-        except Exception as e:  # provider errors are numerous and non-fatal
-            log.debug("lyric scrape failed for %r: %s", query, e)
-            return ""
+        for query in self._query_chain(song):
+            try:
+                text = syncedlyrics.search(query, providers=self.providers) or ""
+            except Exception as e:  # provider errors are numerous and non-fatal
+                log.debug("lyric scrape failed for %r: %s", query, e)
+                continue
+            if text:
+                return text
+        return ""
+
+    def _query_chain(self, song: Song) -> List[str]:
+        """Ordered list of query strings to try, most-specific first,
+        falling back to progressively cleaner variants. `providers`
+        already fans each of these out across every configured backend
+        (LrcLib, NetEase, Musixmatch, Genius, ...) — this is the other
+        axis of resilience: the query text itself, since a query with
+        un-stripped noise ("(Official Video)", "- Sped Up", etc.) can
+        fail on every provider even when a clean version would succeed
+        on the first one."""
+        raw_title = song.title.strip()
+        cleaned_title = strip_noise_tags(raw_title)
+        has_artist = song.artist_confidence != "low" and song.artist.strip()
+
+        candidates = []
+        if has_artist:
+            candidates.append(f"{raw_title} {song.artist}".strip())
+        candidates.append(raw_title)
+        if cleaned_title and cleaned_title != raw_title:
+            if has_artist:
+                candidates.append(f"{cleaned_title} {song.artist}".strip())
+            candidates.append(cleaned_title)
+
+        seen: set = set()
+        chain: List[str] = []
+        for q in candidates:
+            if q and q not in seen:
+                seen.add(q)
+                chain.append(q)
+        return chain
 
     def _sync_caelestia(self, song: Song, lrc_text: str) -> None:
         if not self.caelestia_dir or not self.caelestia_dir.exists():
