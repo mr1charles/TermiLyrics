@@ -18,6 +18,7 @@ Community font packs: drop JSON into `paths.fonts_dir`:
 from __future__ import annotations
 
 import json
+import unicodedata
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol
@@ -124,6 +125,34 @@ class StaticBlockFont:
         if height != self.height:
             return None
         return self.glyphs.get(char) or self.glyphs.get(char.upper())
+
+
+class AccentStrippingFont:
+    """Wraps another glyph source (StaticBlockFont) and retries with the
+    base Latin letter (é->e, ç->c, ñ->n, ...) when the accented form
+    isn't in its hand-authored/pack glyph tables.
+
+    This is what makes Latin-script languages with diacritics NOT
+    covered by a dedicated font pack (French, Portuguese, Italian,
+    Vietnamese, Turkish, ...) render reliably. The substitute is still a
+    real StaticBlockFont glyph at the same known width as its neighbors
+    — unlike falling through to RasterUnicodeFont's fragile system-font
+    lookup, which is what produced misaligned/corrupted-looking lines:
+    when that couldn't find a usable font either, FontEngine's own
+    last-resort fallback inserted the raw character at the wrong width
+    into an otherwise fixed-width block grid, throwing off every
+    column after it."""
+
+    def __init__(self, base: StaticBlockFont):
+        self.base = base
+
+    def get(self, char: str, height: int) -> Optional[List[str]]:
+        stripped = "".join(
+            c for c in unicodedata.normalize("NFKD", char) if not unicodedata.combining(c)
+        )
+        if stripped and stripped != char:
+            return self.base.get(stripped, height)
+        return None
 
 
 class RasterUnicodeFont:
@@ -245,6 +274,8 @@ def _safe(s: str) -> str:
 class FontEngine:
     """Tries every registered source in order; never drops a character."""
 
+    STANDARD_WIDTH = 7  # matches BASE_FONT's hand-authored glyph width
+
     def __init__(self, sources: List[GlyphSource], height: int = 5):
         self.sources = sources
         self.height = height
@@ -254,7 +285,14 @@ class FontEngine:
             rows = source.get(char, self.height)
             if rows:
                 return rows
-        pad_top = (self.height - 1) // 2
-        rows = [" " for _ in range(self.height)]
-        rows[pad_top] = char
-        return rows
+        # Genuinely nothing could render this character (no font source
+        # had it, and it has no accent to strip). Previously this
+        # embedded the raw character into a single row — but that row is
+        # the wrong width compared to every other glyph (a real glyph is
+        # 7 chars wide; a single raw character is 1-2), which corrupts
+        # column alignment for every character after it on the line,
+        # producing exactly the kind of visually broken/cut-off output
+        # this whole fallback chain exists to prevent. A same-width
+        # blank is a better failure mode: the character is silently
+        # dropped, but the rest of the line stays correctly aligned.
+        return [" " * self.STANDARD_WIDTH for _ in range(self.height)]

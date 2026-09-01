@@ -23,10 +23,11 @@ from .config import AppConfig
 from .ai import OllamaSongIdentifier
 from .detect import Song, identify, is_advertisement
 from .fingerprint import AudioIdentifier
-from .fonts import FontEngine, RasterUnicodeFont, StaticBlockFont
+from .fonts import AccentStrippingFont, FontEngine, RasterUnicodeFont, StaticBlockFont
+from .keyboard import RawKeyboard, BACKSPACE_KEYS, TAB_KEY
 from .lyrics import LyricLine, LyricsService, current_and_next
 from .player import PlayerSource
-from .renderer import Renderer
+from .renderer import LiveRenderState, Renderer
 from .sync import SyncEngine
 from .terminal import TerminalSession
 
@@ -62,9 +63,22 @@ class LyricsApp:
         )
 
         static_font = StaticBlockFont(config.paths.fonts_dir, height=config.render.font_height)
+        accent_font = AccentStrippingFont(static_font)
         raster_font = RasterUnicodeFont(cache_dir=config.paths.glyph_cache)
-        self.font_engine = FontEngine([static_font, raster_font], height=config.render.font_height)
-        self.renderer = Renderer(self.font_engine, config.render)
+        # Order matters: exact hand-authored/pack glyph first, then a
+        # same-width accent-stripped substitute (é->e) for anything a
+        # dedicated font pack didn't cover, and only THEN the fragile
+        # system-font raster fallback as a last resort — see fonts.py's
+        # AccentStrippingFont docstring for why this ordering is what
+        # actually fixes misaligned/broken-looking non-English lyrics.
+        self.font_engine = FontEngine(
+            [static_font, accent_font, raster_font], height=config.render.font_height
+        )
+        # Mutable, in-app-adjustable (theme/display-mode/romanize/typing-
+        # effect) — see renderer.LiveRenderState. Seeded from config, then
+        # changed live via keybinds in render_loop(), never reconstructed.
+        self.live = LiveRenderState.from_config(config.render)
+        self.renderer = Renderer(self.font_engine, config.render, live=self.live)
 
         # Optional: only invoked when detect.py's regex parser has LOW
         # confidence in the guessed artist (e.g. an uploader/channel name
@@ -274,14 +288,55 @@ class LyricsApp:
 
             await asyncio.sleep(poll_interval)
 
-    async def render_loop(self, terminal: TerminalSession) -> None:
+    async def render_loop(self, terminal: TerminalSession, keyboard: RawKeyboard) -> None:
         last_line: Optional[str] = None
         last_cols = 0
+        last_rows = 0
         typing_target: str = ""    # the full line currently being "typed"
         typing_start = 0.0         # monotonic time the current typing animation began
         last_revealed: Optional[str] = None  # what was actually drawn last, for typing mode
+        settings_shown_until = 0.0  # monotonic deadline; see h/? handling below
+        was_showing_settings = False
+        live_dirty = False  # set True by any keybind — forces an immediate redraw
         while True:
             size = terminal.size()
+
+            # Non-blocking — never waits for a key, just checks if one's
+            # already waiting. See keyboard.py for what each key does.
+            key = keyboard.poll()
+            if key in BACKSPACE_KEYS:
+                self.live.cycle_theme()
+                live_dirty = True
+            elif key == TAB_KEY:
+                self.live.cycle_display_mode()
+                live_dirty = True
+            elif key == "r":
+                self.live.toggle_romanize()
+                live_dirty = True
+            elif key == "t":
+                self.live.toggle_typing_effect()
+                live_dirty = True
+            elif key in ("h", "?"):
+                settings_shown_until = time.monotonic() + 4.0
+                live_dirty = True
+
+            showing_settings = time.monotonic() < settings_shown_until
+            if was_showing_settings and not showing_settings:
+                # The 4-second window just lapsed — force one more redraw
+                # so the normal lyric line reappears immediately, instead
+                # of the overlay staying frozen on screen until the lyric
+                # text itself happens to change (which might be a while).
+                live_dirty = True
+            was_showing_settings = showing_settings
+
+            if showing_settings:
+                if live_dirty:
+                    frame = self.renderer.build_settings_overlay(size.cols, size.rows)
+                    terminal.draw(frame.lines, size)
+                    live_dirty = False
+                await asyncio.sleep(self.cfg.sync.clock_tick_seconds)
+                continue
+
             state = await asyncio.to_thread(self.player.read)
 
             if state is None:
@@ -327,7 +382,7 @@ class LyricsApp:
                 self.lyric_lines, snapshot.position, max_hold_seconds=self.max_lyric_hold_seconds
             )
 
-            if self.cfg.render.typing_effect:
+            if self.live.typing_effect:
                 if current != last_line:
                     # A new line started (or the display went idle) — restart
                     # the typing animation from scratch for it.
@@ -342,23 +397,25 @@ class LyricsApp:
                 else:
                     revealed = ""
 
-                if revealed != last_revealed or size.cols != last_cols:
+                if revealed != last_revealed or size.cols != last_cols or size.rows != last_rows or live_dirty:
                     frame = self.renderer.build_frame(revealed, size.cols, size.rows)
                     terminal.draw(frame.lines, size)
-                    last_revealed, last_cols = revealed, size.cols
+                    last_revealed, last_cols, last_rows = revealed, size.cols, size.rows
+                    live_dirty = False
             else:
-                if current != last_line or size.cols != last_cols:
+                if current != last_line or size.cols != last_cols or size.rows != last_rows or live_dirty:
                     frame = self.renderer.build_frame(current, size.cols, size.rows)
                     terminal.draw(frame.lines, size)
-                    last_line, last_cols = current, size.cols
+                    last_line, last_cols, last_rows = current, size.cols, size.rows
+                    live_dirty = False
 
             await asyncio.sleep(self.cfg.sync.clock_tick_seconds)
 
     async def run(self) -> None:
-        with TerminalSession() as terminal:
+        with TerminalSession() as terminal, RawKeyboard() as keyboard:
             watcher = asyncio.create_task(self.player_watcher())
             try:
-                await self.render_loop(terminal)
+                await self.render_loop(terminal, keyboard)
             finally:
                 watcher.cancel()
 
@@ -377,6 +434,12 @@ def main() -> None:
             print(f"Unknown mode {arg!r} — usage: lyrics [1|2]  (1 = normal, 2 = typing effect)",
                   file=sys.stderr)
             sys.exit(1)
+
+    print(
+        "Live keybinds — Backspace: cycle color theme  |  Tab: cycle display mode  |  "
+        "r: toggle romanization  |  t: toggle typing effect  |  h or ?: show settings",
+        file=sys.stderr,
+    )
 
     app = LyricsApp(config)
     try:

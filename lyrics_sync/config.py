@@ -53,7 +53,15 @@ class RenderConfig:
     # RasterUnicodeFont already renders any script correctly via Pillow.
     # This is for people who'd rather see "Konnichiwa" than kanji they
     # can't read. See languages.py.
-    romanize: bool = False
+    # Default ON (was off) — non-Latin scripts render unreliably through
+    # the raster Unicode fallback (fonts.py) unless the system happens to
+    # have a CJK/Arabic/Hebrew/Devanagari-capable font installed, which
+    # frequently isn't true and produces blank/broken glyphs when it
+    # isn't. Romanizing first sidesteps that entirely — see
+    # Renderer._prepare_text in renderer.py for the actual fallback
+    # chain (romanize -> if unavailable, safe plain text -> never a
+    # broken giant-block render).
+    romanize: bool = True
 
 
 @dataclass(frozen=True)

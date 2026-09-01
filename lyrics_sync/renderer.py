@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 
 from .config import RenderConfig
 from .fonts import FontEngine
-from .languages import romanize as _romanize
+from .languages import detect_script, romanize as _romanize
 from .terminal import ANSI_BRIGHT, ANSI_DIM, ANSI_RESET, rgb_fg
 
 BLOCK_MODE = "block"
@@ -41,6 +41,41 @@ THEMES: Dict[str, ColorTheme] = {
     "cachyos_green_purple": ColorTheme("CachyOS Green/Purple", (148, 0, 211), (0, 255, 127)),
 }
 DEFAULT_THEME = THEMES["classic_mono"]
+THEME_KEYS: Tuple[str, ...] = tuple(THEMES.keys())
+DISPLAY_MODES: Tuple[str, ...] = (DISPLAY_MINIMALIST, DISPLAY_MUSIC_VIDEO_BOX, DISPLAY_HACKER_MATRIX)
+
+
+@dataclass
+class LiveRenderState:
+    """Mutable, in-app-adjustable settings — deliberately NOT frozen,
+    unlike every other config dataclass in this project (see config.py's
+    'every tunable lives in config.py as a frozen dataclass' comment).
+    This is the one exception: it's meant to change while the app is
+    running, via keybinds (see keyboard.py + main.py's render_loop),
+    without a restart. Seeded from RenderConfig at startup."""
+    theme: str
+    display_mode: str
+    romanize: bool
+    typing_effect: bool
+
+    @classmethod
+    def from_config(cls, cfg: RenderConfig) -> "LiveRenderState":
+        return cls(theme=cfg.theme, display_mode=cfg.display_mode,
+                   romanize=cfg.romanize, typing_effect=cfg.typing_effect)
+
+    def cycle_theme(self) -> None:
+        i = THEME_KEYS.index(self.theme) if self.theme in THEME_KEYS else -1
+        self.theme = THEME_KEYS[(i + 1) % len(THEME_KEYS)]
+
+    def cycle_display_mode(self) -> None:
+        i = DISPLAY_MODES.index(self.display_mode) if self.display_mode in DISPLAY_MODES else -1
+        self.display_mode = DISPLAY_MODES[(i + 1) % len(DISPLAY_MODES)]
+
+    def toggle_romanize(self) -> None:
+        self.romanize = not self.romanize
+
+    def toggle_typing_effect(self) -> None:
+        self.typing_effect = not self.typing_effect
 
 
 @dataclass
@@ -49,11 +84,19 @@ class Frame:
 
 
 class Renderer:
-    def __init__(self, font_engine: FontEngine, config: RenderConfig):
+    def __init__(self, font_engine: FontEngine, config: RenderConfig,
+                 live: "LiveRenderState | None" = None):
         self.fonts = font_engine
         self.cfg = config
-        self._theme = THEMES.get(config.theme, DEFAULT_THEME)
+        # `live` carries the 4 settings that can change at runtime; falls
+        # back to a fresh one seeded from `config` so existing callers
+        # (including tests) that don't pass one still work unchanged.
+        self.live = live if live is not None else LiveRenderState.from_config(config)
         self._matrix_rng = random.Random()
+
+    @property
+    def _theme(self) -> ColorTheme:
+        return THEMES.get(self.live.theme, DEFAULT_THEME)
 
     # ---- measurement (uses the font engine, so widths are correct
     #      regardless of which glyph source actually drew a character) ----
@@ -188,24 +231,91 @@ class Renderer:
         height = self.fonts.height
         return sum((height + 1) if mode == BLOCK_MODE else 1 for mode, _ in segments)
 
+    def _prepare_text(self, text: str) -> Tuple[str, bool]:
+        """Returns (text_to_render, force_plain_mode).
+
+        Non-Latin scripts are the unreliable case for giant block-letter
+        rendering: the raster Unicode fallback (fonts.py) depends on the
+        system having a CJK/Arabic/Hebrew/Devanagari-capable font
+        installed, which frequently isn't true, and produces blank or
+        broken-looking glyphs when it isn't. Two ways out, tried in order:
+
+        1. Romanize it. StaticBlockFont's hand-authored glyphs are
+           guaranteed to exist for every Latin letter, so romanized text
+           always renders correctly as giant art.
+        2. If romanization isn't available for this script either (the
+           right optional library — pykakasi/pypinyin/etc — isn't
+           installed), don't attempt giant block rendering of the native
+           script at all. Fall back to normal-sized plain text instead,
+           which relies on the *terminal emulator's* own font (near-
+           universally has full Unicode coverage) rather than our own
+           font-path guessing. Still readable, just not giant — that's
+           a better failure mode than blank or garbled output.
+        """
+        script = detect_script(text)
+        if script == "latin":
+            return text, False
+
+        if not self.live.romanize:
+            # User explicitly asked to see the native script (romanize
+            # toggled off) — accept whatever the raster fallback can do.
+            return text, False
+
+        result = _romanize(text)
+        if result.was_romanized:
+            return result.text, False
+        return text, True  # no romanizer available — force safe plain text
+
+    def build_settings_overlay(self, cols: int, rows: int) -> Frame:
+        """A brief on-screen HUD (shown for a few seconds after pressing
+        h/? — see main.py) listing current live settings and their
+        keybinds. Deliberately plain, readable text, not giant block
+        art — a settings screen should be scannable, not decorative."""
+        theme_name = THEMES.get(self.live.theme, DEFAULT_THEME).name
+        lines = [
+            "SETTINGS",
+            "",
+            f"Theme: {theme_name:<24} [Backspace] cycle theme",
+            f"Display mode: {self.live.display_mode:<17} [Tab] cycle display mode",
+            f"Romanize non-Latin lyrics: {'ON' if self.live.romanize else 'OFF':<3} [r] toggle",
+            f"Typing effect: {'ON' if self.live.typing_effect else 'OFF':<17} [t] toggle",
+            "",
+            "[h / ?] show this again",
+        ]
+        # Center the block as a whole (based on its widest line), not
+        # each line independently — independent centering makes ragged
+        # left edges that are hard to scan, defeating the point of a
+        # settings screen.
+        block_width = max(len(l) for l in lines)
+        left_pad = max((cols - block_width) // 2, 0)
+        top_pad = max((rows - len(lines)) // 2, 0)
+        out = [""] * top_pad
+        for line in lines:
+            out.append(" " * left_pad + f"{ANSI_BRIGHT}{line}{ANSI_RESET}")
+        return Frame(lines=out)
+
     def build_frame(self, lyric_line: str, cols: int, rows: int) -> Frame:
         display = lyric_line or "♪ ♪ ♪"
+        force_plain = False
 
-        if self.cfg.romanize and display != "♪ ♪ ♪":
-            display = _romanize(display).text
+        if display != "♪ ♪ ♪":
+            display, force_plain = self._prepare_text(display)
 
-        segments = self._segments(display, cols)
-
-        # Giant block letters need real vertical room — each wrapped segment
-        # costs (glyph height + 1) rows. A narrow terminal (e.g. a
-        # quarter-tiled window) can force so many word-wraps that the total
-        # comfortably exceeds what's available, and the excess just gets
-        # silently truncated by the terminal draw, showing only a
-        # fragment of the line. If that's clearly going to happen, fall
-        # back to compact plain text instead — still readable, just not
-        # giant.
-        if self._estimated_row_count(segments) > rows:
+        if force_plain:
             segments = [(PLAIN_MODE, line) for line in self._plain_wrap(display, max(cols - 2, 1))]
+        else:
+            segments = self._segments(display, cols)
+
+            # Giant block letters need real vertical room — each wrapped segment
+            # costs (glyph height + 1) rows. A narrow terminal (e.g. a
+            # quarter-tiled window) can force so many word-wraps that the total
+            # comfortably exceeds what's available, and the excess just gets
+            # silently truncated by the terminal draw, showing only a
+            # fragment of the line. If that's clearly going to happen, fall
+            # back to compact plain text instead — still readable, just not
+            # giant.
+            if self._estimated_row_count(segments) > rows:
+                segments = [(PLAIN_MODE, line) for line in self._plain_wrap(display, max(cols - 2, 1))]
 
         render_lines: List[Tuple[str, str]] = []
         for mode, seg in segments:
@@ -220,9 +330,9 @@ class Renderer:
         while render_lines and render_lines[-1][0] == "blank":
             render_lines.pop()
 
-        if self.cfg.display_mode == DISPLAY_MUSIC_VIDEO_BOX:
+        if self.live.display_mode == DISPLAY_MUSIC_VIDEO_BOX:
             return self._build_boxed_frame(render_lines, cols, rows)
-        if self.cfg.display_mode == DISPLAY_HACKER_MATRIX:
+        if self.live.display_mode == DISPLAY_HACKER_MATRIX:
             return self._build_matrix_frame(render_lines, cols, rows)
         return self._build_minimalist_frame(render_lines, cols, rows)
 
