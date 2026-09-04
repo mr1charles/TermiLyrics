@@ -11,6 +11,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from .cache import TextCache
 from .detect import Song, strip_noise_tags
+from .ai import OllamaSongIdentifier
 
 log = logging.getLogger(__name__)
 
@@ -44,10 +45,17 @@ def parse_lrc(text: str) -> List[LyricLine]:
 
 class LyricsService:
     def __init__(self, cache: TextCache, providers: Sequence[str],
-                 caelestia_dir: Optional[Path] = None):
+                 caelestia_dir: Optional[Path] = None,
+                 song_identifier: Optional[OllamaSongIdentifier] = None):
         self.cache = cache
         self.providers = list(providers)
         self.caelestia_dir = caelestia_dir
+        # Genuine last resort — see _scrape. Optional; None means this
+        # fallback tier is simply skipped, same as if Ollama weren't
+        # running (song_identifier.identify() already degrades to None
+        # in that case too, so passing one in costs nothing when it's
+        # unavailable).
+        self.song_identifier = song_identifier
 
     def fetch(self, song: Song, force_retry: bool = False) -> List[LyricLine]:
         key = song.key
@@ -76,6 +84,31 @@ class LyricsService:
                 continue
             if text:
                 return text
+
+        # Every direct query came up empty. For a heavily-retitled track
+        # (remix edits regex-cleaning can't fully normalize, or just an
+        # uploader's unusual wording) even a noise-stripped title can
+        # still not match anything a provider recognizes. Genuine last
+        # resort: ask the local Ollama model (if configured — see
+        # ai.py's OllamaSongIdentifier) to recognize the real song, and
+        # try once more with its answer. This only runs after every
+        # direct query has already failed, so it costs nothing extra on
+        # the common successful-search path — the latency it adds is
+        # scoped entirely to the case that would otherwise just be
+        # "lyrics not found."
+        if self.song_identifier is not None:
+            refined = self.song_identifier.identify(song.title, song.artist)
+            if refined:
+                ai_artist, ai_title = refined
+                query = f"{ai_title} {ai_artist}".strip()
+                try:
+                    text = syncedlyrics.search(query, providers=self.providers) or ""
+                except Exception as e:
+                    log.debug("AI-assisted lyric scrape failed for %r: %s", query, e)
+                    return ""
+                if text:
+                    return text
+
         return ""
 
     def _query_chain(self, song: Song) -> List[str]:

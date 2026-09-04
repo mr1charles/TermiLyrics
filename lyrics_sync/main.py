@@ -55,11 +55,25 @@ class LyricsApp:
         self.player = PlayerSource()
         self.sync = SyncEngine(config.sync)
 
+        # Optional: primarily invoked when detect.py's regex parser has LOW
+        # confidence in the guessed artist (e.g. an uploader/channel name
+        # mistaken for the real artist) — see below. Also passed into
+        # LyricsService as a genuine last-resort lyric-search fallback (see
+        # lyrics.py's _scrape) for tracks a cleaned title still can't
+        # match. Availability is probed lazily and cached — if Ollama
+        # isn't running, both uses silently do nothing.
+        self.song_identifier: Optional[OllamaSongIdentifier] = (
+            OllamaSongIdentifier(model=config.ollama_model, host=config.ollama_host,
+                                  timeout=config.song_id_timeout_seconds)
+            if config.ai_enabled else None
+        )
+
         caelestia_dir = Path(os.path.expanduser("~/.cache/caelestia/lyrics/LRCLIB"))
         self.lyrics_service = LyricsService(
             TextCache(config.paths.lyrics_cache),
             config.providers,
             caelestia_dir=caelestia_dir if caelestia_dir.exists() else None,
+            song_identifier=self.song_identifier,
         )
 
         static_font = StaticBlockFont(config.paths.fonts_dir, height=config.render.font_height)
@@ -79,16 +93,6 @@ class LyricsApp:
         # changed live via keybinds in render_loop(), never reconstructed.
         self.live = LiveRenderState.from_config(config.render)
         self.renderer = Renderer(self.font_engine, config.render, live=self.live)
-
-        # Optional: only invoked when detect.py's regex parser has LOW
-        # confidence in the guessed artist (e.g. an uploader/channel name
-        # mistaken for the real artist). Availability is probed lazily and
-        # cached — if Ollama isn't running, this silently does nothing.
-        self.song_identifier: Optional[OllamaSongIdentifier] = (
-            OllamaSongIdentifier(model=config.ollama_model, host=config.ollama_host,
-                                  timeout=config.song_id_timeout_seconds)
-            if config.ai_enabled else None
-        )
 
         # Last-resort fallback for content with no text clue at all — see
         # fingerprint.py. Off unless the user has configured an API key.
@@ -298,6 +302,21 @@ class LyricsApp:
         settings_shown_until = 0.0  # monotonic deadline; see h/? handling below
         was_showing_settings = False
         live_dirty = False  # set True by any keybind — forces an immediate redraw
+
+        # player.read() shells out to the `playerctl` CLI — a real process
+        # spawn, not a cheap call. sync.tick() only actually *uses* fresh
+        # position data once every poll_interval_seconds internally anyway
+        # (see sync.py's tick() — it rate-limits its own drift correction);
+        # calling player.read() on every fast render tick was spawning a
+        # subprocess ~20x/second for data that was mostly being thrown
+        # away, real overhead that could itself cause the render loop to
+        # occasionally miss its own tick budget. Poll only this often,
+        # reuse the cached state otherwise — tick() still gets called every
+        # fast tick either way, so extrapolated position (and therefore
+        # line-change responsiveness) stays exactly as fast as before.
+        cached_state = None
+        last_poll_at = 0.0
+
         while True:
             size = terminal.size()
 
@@ -315,6 +334,9 @@ class LyricsApp:
                 live_dirty = True
             elif key == "t":
                 self.live.toggle_typing_effect()
+                live_dirty = True
+            elif key == "a":
+                self.live.cycle_text_style()
                 live_dirty = True
             elif key in ("h", "?"):
                 settings_shown_until = time.monotonic() + 4.0
@@ -337,7 +359,12 @@ class LyricsApp:
                 await asyncio.sleep(self.cfg.sync.clock_tick_seconds)
                 continue
 
-            state = await asyncio.to_thread(self.player.read)
+            state = cached_state
+            now = time.monotonic()
+            if state is None or (now - last_poll_at) >= self.cfg.sync.poll_interval_seconds:
+                state = await asyncio.to_thread(self.player.read)
+                cached_state = state
+                last_poll_at = now
 
             if state is None:
                 terminal.draw(["[ no player detected ]".center(size.cols)], size)
@@ -437,7 +464,8 @@ def main() -> None:
 
     print(
         "Live keybinds — Backspace: cycle color theme  |  Tab: cycle display mode  |  "
-        "r: toggle romanization  |  t: toggle typing effect  |  h or ?: show settings",
+        "a: cycle text style (auto/block/plain)  |  r: toggle romanization  |  "
+        "t: toggle typing effect  |  h or ?: show settings",
         file=sys.stderr,
     )
 

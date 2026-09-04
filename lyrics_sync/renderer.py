@@ -44,6 +44,11 @@ DEFAULT_THEME = THEMES["classic_mono"]
 THEME_KEYS: Tuple[str, ...] = tuple(THEMES.keys())
 DISPLAY_MODES: Tuple[str, ...] = (DISPLAY_MINIMALIST, DISPLAY_MUSIC_VIDEO_BOX, DISPLAY_HACKER_MATRIX)
 
+TEXT_STYLE_AUTO = "auto"
+TEXT_STYLE_BLOCK = "block"
+TEXT_STYLE_PLAIN = "plain"
+TEXT_STYLES: Tuple[str, ...] = (TEXT_STYLE_AUTO, TEXT_STYLE_BLOCK, TEXT_STYLE_PLAIN)
+
 
 @dataclass
 class LiveRenderState:
@@ -57,6 +62,7 @@ class LiveRenderState:
     display_mode: str
     romanize: bool
     typing_effect: bool
+    text_style: str = TEXT_STYLE_AUTO
 
     @classmethod
     def from_config(cls, cfg: RenderConfig) -> "LiveRenderState":
@@ -70,6 +76,10 @@ class LiveRenderState:
     def cycle_display_mode(self) -> None:
         i = DISPLAY_MODES.index(self.display_mode) if self.display_mode in DISPLAY_MODES else -1
         self.display_mode = DISPLAY_MODES[(i + 1) % len(DISPLAY_MODES)]
+
+    def cycle_text_style(self) -> None:
+        i = TEXT_STYLES.index(self.text_style) if self.text_style in TEXT_STYLES else -1
+        self.text_style = TEXT_STYLES[(i + 1) % len(TEXT_STYLES)]
 
     def toggle_romanize(self) -> None:
         self.romanize = not self.romanize
@@ -277,6 +287,7 @@ class Renderer:
             "",
             f"Theme: {theme_name:<24} [Backspace] cycle theme",
             f"Display mode: {self.live.display_mode:<17} [Tab] cycle display mode",
+            f"Text style: {self.live.text_style:<19} [a] cycle (auto / block / plain)",
             f"Romanize non-Latin lyrics: {'ON' if self.live.romanize else 'OFF':<3} [r] toggle",
             f"Typing effect: {'ON' if self.live.typing_effect else 'OFF':<17} [t] toggle",
             "",
@@ -301,20 +312,31 @@ class Renderer:
         if display != "♪ ♪ ♪":
             display, force_plain = self._prepare_text(display)
 
+        # `text_style` (see LiveRenderState, cycled with 'a') is the
+        # explicit user override; PLAIN/BLOCK bypass the automatic
+        # overflow check below entirely.
+        if self.live.text_style == TEXT_STYLE_PLAIN:
+            force_plain = True
+
         if force_plain:
             segments = [(PLAIN_MODE, line) for line in self._plain_wrap(display, max(cols - 2, 1))]
         else:
             segments = self._segments(display, cols)
 
-            # Giant block letters need real vertical room — each wrapped segment
-            # costs (glyph height + 1) rows. A narrow terminal (e.g. a
-            # quarter-tiled window) can force so many word-wraps that the total
-            # comfortably exceeds what's available, and the excess just gets
-            # silently truncated by the terminal draw, showing only a
-            # fragment of the line. If that's clearly going to happen, fall
-            # back to compact plain text instead — still readable, just not
-            # giant.
-            if self._estimated_row_count(segments) > rows:
+            # Giant block letters need real vertical room — each wrapped
+            # segment costs (glyph height + 1) rows, and a full sentence
+            # easily needs more of those than a *standard 80x24 terminal
+            # even has* (a completely ordinary 8-word line can need 30+
+            # rows). Terminal.draw() already truncates safely to
+            # whatever's available (see terminal.py) — showing however
+            # much of the giant line fits is a much better default than
+            # abandoning giant-letter rendering for nearly every song,
+            # which is what comparing against the *full* estimated cost
+            # did. Only bail to plain text when literally nothing would
+            # be visible at all (not even one wrapped row fits) — that's
+            # the one case truncation can't save.
+            one_row_fits = (self.fonts.height + 1) <= rows
+            if self.live.text_style != TEXT_STYLE_BLOCK and not one_row_fits:
                 segments = [(PLAIN_MODE, line) for line in self._plain_wrap(display, max(cols - 2, 1))]
 
         render_lines: List[Tuple[str, str]] = []

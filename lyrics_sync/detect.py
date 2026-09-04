@@ -31,7 +31,18 @@ _NOISE_TAGS = [
     # they get treated as if THEY were the title, and searching a lyric
     # provider for a song literally called "Sped Up" matches something
     # completely unrelated.
-    r"\bsped\s*up\b", r"\bslowed(\s*\+?\s*reverb)?\b", r"\bnightcore\b",
+    r"\bsped\s*up\b",
+    # "Slowed + Reverb" shows up with every connector people actually
+    # type — "+", "&", "and", or nothing at all — and sometimes with
+    # "Down" in the middle ("Slowed Down + Reverb"). The combined
+    # phrase-level patterns catch the "and"/"&"/"+" connector cases
+    # explicitly (so the connector word itself gets consumed, not left
+    # behind as stray text); the standalone word patterns after that
+    # are the fallback for when there's no connector at all.
+    r"\bslowed(\s*down)?\s*(?:and|[+&])\s*reverb(?:erated)?\b",
+    r"\breverb(?:erated)?\s*(?:and|[+&])\s*slowed(\s*down)?\b",
+    r"\bslowed(\s*down)?\b", r"\breverb(?:erated)?\b",
+    r"\bnightcore\b",
     r"\b8d\s*audio\b", r"\bbass\s*boosted\b", r"\btiktok\s*version\b",
 ]
 _FEAT_TAGS = [
@@ -148,7 +159,7 @@ def _strip_noise(text: str) -> str:
     # A tag stripped by its bare word (e.g. "Nightcore" inside "(Nightcore)")
     # leaves an empty bracket pair behind — clean those up too.
     text = re.sub(r"\(\s*\)|\[\s*\]", "", text)
-    return re.sub(r"\s{2,}", " ", text).strip(" -–|")
+    return re.sub(r"\s{2,}", " ", text).strip(" -–|+&")
 
 
 # Public alias — lyrics.py's fallback search chain reuses this exact
