@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 _NOISE_TAGS = [
     r"\(official\s*video\)", r"\(official\s*audio\)", r"\(official\s*music\s*video\)",
@@ -31,7 +32,16 @@ _NOISE_TAGS = [
     # they get treated as if THEY were the title, and searching a lyric
     # provider for a song literally called "Sped Up" matches something
     # completely unrelated.
-    r"\bsped\s*up\b",
+    # A speed percentage only counts as noise right next to an edit
+    # keyword — "100% Pure Love" is a real title.
+    r"\b(?:slowed|sped\s*up|speed\s*up|nightcore)(?:\s*down)?"
+    r"(?:\s*(?:and|[+&])\s*reverb(?:erated)?)?\s*\d{2,3}\s*%",
+    r"\bsped\s*up(?:\s*version)?\b", r"\bspeed\s*up(?:\s*version)?\b",
+    r"\b(?:super|ultra|extra|perfectly)\s*slowed\b", r"\bslowed\s*to\s*perfection\b",
+    r"\bchopped\s*(?:and|&|n|'n')\s*screwed\b", r"\bdaycore\b",
+    # explicit speed factors: "0.8x", "x1.25", "(80% speed)"
+    r"(?<![\w.])(?:[0-2]\.\d{1,2}|[12])\s*x\b(?:\s*speed)?", r"(?<![\w.])x\s*[0-2]\.\d{1,2}\b",
+    r"\b\d{2,3}\s*%\s*(?:speed|slowed|faster)\b",
     # "Slowed + Reverb" shows up with every connector people actually
     # type — "+", "&", "and", or nothing at all — and sometimes with
     # "Down" in the middle ("Slowed Down + Reverb"). The combined
@@ -133,6 +143,55 @@ def _strip_translation_suffix(text: str) -> str:
     return text
 
 
+_SLOWED_RE = re.compile(
+    r"\bslowed\b|\bdaycore\b|\bchopped\s*(?:and|&|n|'n')\s*screwed\b|\bscrewed\b", re.I)
+_SPED_RE = re.compile(r"\bsped\s*up\b|\bspeed\s*up\b|\bnightcore\b|\bspedup\b", re.I)
+_FACTOR_RES = (
+    re.compile(r"(?<![\w.])([0-2]\.\d{1,2}|[12])\s*x\b", re.I),   # 0.8x, 1.25x
+    re.compile(r"(?<![\w.])x\s*([0-2]\.\d{1,2})\b", re.I),        # x0.8
+)
+_PERCENT_RE = re.compile(r"\b(\d{2,3})\s*%", re.I)
+
+
+def detect_variant(raw_title: str) -> Tuple[str, Optional[float]]:
+    """(variant, speed_hint) for a raw player/tab title.
+
+    variant is "slowed", "sped_up" or "" (original tempo). Reverb, 8D and
+    bass-boost edits don't change tempo, so they are *not* variants — only
+    edits that resample the audio (and therefore stretch every lyric
+    timestamp by the same factor) are. speed_hint is an explicit factor
+    stated in the title ("0.8x", "x1.25", "slowed 85%"), when present.
+    """
+    text = raw_title or ""
+    variant = ""
+    if _SLOWED_RE.search(text):
+        variant = "slowed"
+    elif _SPED_RE.search(text):
+        variant = "sped_up"
+
+    hint: Optional[float] = None
+    for pat in _FACTOR_RES:
+        m = pat.search(text)
+        if m:
+            try:
+                hint = float(m.group(1))
+            except ValueError:
+                hint = None
+            break
+    if hint is None and variant:
+        m = _PERCENT_RE.search(text)
+        if m:
+            hint = int(m.group(1)) / 100.0
+    if hint is not None and not (0.5 <= hint <= 2.0 and abs(hint - 1.0) > 0.01):
+        hint = None
+    if hint is not None and not variant:
+        variant = "slowed" if hint < 1.0 else "sped_up"
+    # "slowed 125%" is contradictory — trust the keyword, drop the number.
+    if hint is not None and ((variant == "slowed" and hint > 1.0) or (variant == "sped_up" and hint < 1.0)):
+        hint = None
+    return variant, hint
+
+
 @dataclass(frozen=True)
 class Song:
     artist: str
@@ -147,10 +206,32 @@ class Song:
     #         all — it's how "R&BHype - Love Me Not" ends up matching some
     #         unrelated "Love Me or Not" instead of the right song.
     artist_confidence: str = "high"
+    # Tempo variant of the recording, detected from the *raw* title before
+    # noise-stripping: "" (original), "slowed" or "sped_up". Lyrics for a
+    # variant are fetched for the original song and re-timed — see
+    # timing.variant_scale().
+    variant: str = ""
+    # Explicit speed factor when the title states one ("0.8x", "80% speed").
+    speed_hint: Optional[float] = None
+    album: str = ""
 
     @property
     def key(self) -> str:
+        """Lyrics cache key. Deliberately excludes the variant: a slowed
+        upload uses the exact same lyric text as the original."""
         return f"{self.artist.strip().lower()}::{self.title.strip().lower()}"
+
+    @property
+    def identity(self) -> str:
+        """Track-change key. Unlike `key`, the original and its slowed
+        version are different tracks — autoplay moving from one to the
+        other has to re-time everything."""
+        hint = f"{self.speed_hint:.3f}" if self.speed_hint else ""
+        return f"{self.key}::{self.variant}:{hint}"
+
+    @property
+    def variant_label(self) -> str:
+        return {"slowed": "slowed", "sped_up": "sped up"}.get(self.variant, "")
 
 
 def _strip_noise(text: str) -> str:
@@ -201,12 +282,24 @@ def _artist_agrees_with_title_guess(metadata_artist: str, title_guess: str) -> b
     return a == b or a in b or b in a
 
 
-def identify(raw_title: str, raw_artist: str = "", source: str = "") -> Song:
-    """Best-effort parse of a raw (title, artist) pair into a clean Song.
+def identify(raw_title: str, raw_artist: str = "", source: str = "", album: str = "") -> Song:
+    """Best-effort parse of a raw (title, artist) pair into a clean Song,
+    including its tempo variant (see detect_variant)."""
+    song = _identify(raw_title, raw_artist, source)
+    variant, hint = detect_variant(raw_title or "")
+    if not variant:
+        # Some uploads put the edit tag in the artist/channel field instead.
+        variant, hint = detect_variant(raw_artist or "")
+    if variant or album:
+        song = Song(artist=song.artist, title=song.title, artist_confidence=song.artist_confidence,
+                    variant=variant, speed_hint=hint, album=(album or "").strip())
+    return song
 
-    `source` is an optional hint ("spotify", "youtube_music", "firefox", ...)
-    used only to disambiguate "Song - Artist" vs "Artist - Song" ordering;
-    the parser degrades gracefully without it.
+
+def _identify(raw_title: str, raw_artist: str = "", source: str = "") -> Song:
+    """`source` is an optional hint ("spotify", "youtube_music", "firefox",
+    ...) used only to disambiguate "Song - Artist" vs "Artist - Song"
+    ordering; the parser degrades gracefully without it.
     """
     title = _strip_translation_suffix(_strip_noise(_strip_browser_chrome(raw_title or "")))
     artist, artist_field_confidence = _resolve_artist_field(raw_artist or "")
