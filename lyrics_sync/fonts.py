@@ -89,7 +89,51 @@ BASE_FONT: Dict[str, List[str]] = {
     # placeholder (instrumental intros/breaks/outros). Hand-drawn instead of
     # left to the Pillow raster fallback since it's shown very often.
     '♪': ["  ██  ", "  ██  ", "  ██  ", "███   ", "███   "],
+    ':': ["  ", "██", "  ", "██", "  "],
+    ';': ["   ", " ██", "   ", " ██", "██ "],
+    '&': [" ███   ", "██ ██  ", " ███ ██", "██ ███ ", " ███ ██"],
+    '/': ["    ██", "   ██ ", "  ██  ", " ██   ", "██    "],
+    '+': ["      ", "  ██  ", "██████", "  ██  ", "      "],
+    '*': ["      ", "█ ██ █", " ████ ", "█ ██ █", "      "],
+    '#': [" ██ ██ ", "███████", " ██ ██ ", "███████", " ██ ██ "],
+    '%': ["██   ██", "    ██ ", "   ██  ", "  ██   ", "██   ██"],
+    '=': ["      ", "██████", "      ", "██████", "      "],
+    '_': ["      ", "      ", "      ", "      ", "██████"],
+    '[': ["███", "██ ", "██ ", "██ ", "███"],
+    ']': ["███", " ██", " ██", " ██", "███"],
+    '…': ["          ", "          ", "          ", "          ", "██  ██  ██"],
 }
+# Typographic variants lyric providers use constantly ("I’m", “quoted”,
+# em-dashes). Without these they fell through to the raster fallback,
+# which draws them at a different width from everything around them.
+for _alias, _base in (("’", "'"), ("‘", "'"), ("`", "'"), ("´", "'"), ("“", '"'), ("”", '"'),
+                      ("„", '"'), ("—", "-"), ("–", "-"), ("‐", "-"), ("¸", ",")):
+    BASE_FONT[_alias] = BASE_FONT[_base]
+
+# Half-block compression — see compress_half_blocks().
+_DENSE = set("█▓▒#%@*+=")
+
+
+def compress_half_blocks(rows: List[str]) -> List[str]:
+    """Squash a glyph to half its height using ▀ ▄ █: every terminal row
+    carries two glyph rows. A 5-row letter becomes 3 rows with its exact
+    horizontal shape intact — the "medium" text size, which lets a whole
+    lyric line fit on an ordinary 80x24 terminal in giant-ish letters."""
+    if not rows:
+        return rows
+    width = max(len(r) for r in rows)
+    padded = [r.ljust(width) for r in rows]
+    if len(padded) % 2:
+        padded.append(" " * width)
+    out = []
+    for y in range(0, len(padded), 2):
+        top, bottom = padded[y], padded[y + 1]
+        line = []
+        for a, b in zip(top, bottom):
+            ta, tb = a in _DENSE, b in _DENSE
+            line.append("█" if ta and tb else "▀" if ta else "▄" if tb else " ")
+        out.append("".join(line))
+    return out
 
 
 class GlyphSource(Protocol):
@@ -271,6 +315,10 @@ def _safe(s: str) -> str:
     return "".join(c if c.isalnum() else f"u{ord(c):x}" for c in s)[:64]
 
 
+SIZE_BIG = "big"
+SIZE_MEDIUM = "medium"
+
+
 class FontEngine:
     """Tries every registered source in order; never drops a character."""
 
@@ -279,8 +327,27 @@ class FontEngine:
     def __init__(self, sources: List[GlyphSource], height: int = 5):
         self.sources = sources
         self.height = height
+        self._cache: Dict[tuple, List[str]] = {}
 
-    def glyph(self, char: str) -> List[str]:
+    def height_for(self, size: str = SIZE_BIG) -> int:
+        return (self.height + 1) // 2 if size == SIZE_MEDIUM else self.height
+
+    def glyph(self, char: str, size: str = SIZE_BIG) -> List[str]:
+        key = (char, size)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        rows = self._glyph(char)
+        if size == SIZE_MEDIUM:
+            rows = compress_half_blocks(rows)
+        # Normalize: every row the same width, so layout math is exact.
+        width = max((len(r) for r in rows), default=0)
+        rows = [r.ljust(width) for r in rows]
+        if len(self._cache) < 4096:
+            self._cache[key] = rows
+        return rows
+
+    def _glyph(self, char: str) -> List[str]:
         for source in self.sources:
             rows = source.get(char, self.height)
             if rows:

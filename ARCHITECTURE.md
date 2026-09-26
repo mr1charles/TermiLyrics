@@ -107,10 +107,12 @@ loading placeholder.
 ### 2.6 Modules — Problem 6
 
 `config.py, terminal.py, player.py, sync.py, detect.py, cache.py, lyrics.py,
-transcript.py, alignment.py, fonts.py, renderer.py, ai.py, main.py` — each
-owns one concern, communicates through small dataclasses
-(`PlayerState`, `Song`, `LyricLine`, `AlignedLine`, `SyncSnapshot`), and has no
-module-level mutable state.
+timing.py, transcript.py, alignment.py, fonts.py, canvas.py, themes.py,
+renderer.py, keyboard.py, settings.py, demo.py, fingerprint.py, ai.py,
+main.py` — each owns one concern and communicates through small dataclasses
+(`PlayerState`, `Song`, `LyricLine`/`Word`, `LyricsResult`, `Cursor`,
+`TempoMap`, `Scene`, `SyncSnapshot`). The only module-level mutable state is
+the terminal color mode, set once at startup.
 
 ### 2.7 Renderer (`renderer.py`) — Problem 7
 
@@ -140,13 +142,82 @@ caller gets `None` back, never an exception. Nothing in the app requires it.
 - Multiple players: `PlayerSource.read()` walks preferred → all `playerctl -l`
   players → default, skipping any that error.
 
-## 3. Migration plan
+## 3. v0.1 upgrade
+
+### 3.1 Player reads (`player.py`)
+One `playerctl --all-players metadata --format …` process per poll covers
+every player (the old code spawned five processes *per player*), and every
+`PlayerState` carries `sampled_at` — the monotonic time its position was
+true (midpoint of the subprocess call). Among several players: playing beats
+paused, then the player we were already following, then `--player` prefs.
+
+### 3.2 Sync engine (`sync.py`)
+Extrapolation is anchored at the *sample* time, not the time the reading
+was processed, so song identification or an AI call between read and reset
+no longer shifts the clock. Playback rate is learned by least squares over
+the last ~8s of readings (snapped to common speeds; a poor fit discards the
+older half so a speed change is picked up within seconds). The correction
+dead-band is 3x the *spread* (MAD) of recent drift — a steady offset has no
+spread, so it is always corrected; real jitter is ignored. `position()`
+holds still instead of stepping backwards for sub-0.3s corrections.
+Simulated against noisy 0.75x/1.0x/1.25x players, error stays under 0.1s.
+
+### 3.3 Lyric finder (`lyrics.py`)
+- Parser: multiple timestamps per line, `[offset:]`, `[length:]`, `[mm:ss:xx]`,
+  enhanced word tags (`<mm:ss.xx>`, both A2 and syncedlyrics' richsync
+  spacing), per-character CJK timing, credit/URL line removal.
+- LrcLib is queried directly and candidates are scored on title (noise-
+  stripped, accent-folded), artist, and **duration** vs. the playing track,
+  with penalties for live/remix/instrumental/etc. versions the title didn't
+  ask for. syncedlyrics runs second, `synced_only=True` (plain lyrics used
+  to end the search), and results longer than the track are rejected.
+- A JSON sidecar per song caches duration/source, and a 12h negative cache
+  (only when LrcLib answered cleanly — never on a network error).
+- Word-level timing (Musixmatch richsync via syncedlyrics) is fetched in
+  the background after line-synced lyrics are showing, and only swapped in
+  if `lyrics_match()` confirms same text and timing within ~2s.
+
+### 3.4 Timeline (`timing.py`)
+`LyricTimeline` precomputes per-word times — real ones, or estimates spread
+over the time a line is plausibly *sung* (syllable-weighted, ~2–5
+syllables/s) rather than the whole gap to the next line — and `locate(t)`
+returns a `Cursor` (line, word, progress, gap countdown) in O(log n).
+
+### 3.5 Slowed / sped-up tracks (`detect.py`, `timing.py`, `fingerprint.py`)
+`detect_variant()` reads the raw title (slowed, sped up, nightcore, daycore,
+chopped & screwed, `0.8x`, `x1.25`, `85%`). `Song.key` (cache) ignores the
+variant; `Song.identity` (track change) includes it. `variant_scale()` picks
+the lyric-time scale: original length / track length when both are known and
+agree with the tag, else the title's factor, else a typical value flagged as
+a guess. Untagged tracks are only stretched on request (`v`), since a music
+video's intro also makes lengths differ. `TempoMap` applies
+`lyric_time = position * scale + offset`. Audio fingerprinting retries at
+resample factors (ffmpeg `asetrate`) so slowed audio matches the original
+recording, and the matching factor *is* the track's speed.
+
+### 3.6 Rendering (`canvas.py`, `renderer.py`, `terminal.py`)
+Every mode paints into a `Canvas` cell grid (wide/combining-character aware)
+serialized once per frame; `TerminalSession.draw` rewrites only changed rows
+on the alternate screen (no full clear → no flicker). Colors degrade from
+truecolor to 256/16/none. Six modes (minimalist, karaoke, scroll, word_pop,
+box, matrix), six transitions, a half-block "medium" text size between giant
+and plain, and `Frame.animating` so static frames aren't redrawn — the app
+loop only runs at `fps` while something moves.
+
+### 3.7 App (`main.py`, `keyboard.py`, `settings.py`, `demo.py`)
+One poller feeds the sync engine; the render loop reads keys (escape
+sequences parsed from raw fd reads) and renders. Blocking network work runs
+in daemon threads so a stuck provider can't hang quitting. Live settings and
+per-track sync adjustments persist as JSON. `--demo` swaps in a local player
+and a built-in word-timed song.
+
+## 4. Migration plan
 
 1. Drop `lyrics_sync/` next to the old `lyrics-sync.py`; keep the old file
    untouched until the new one is verified.
 2. `pip install -r requirements.txt` (Pillow/PyYAML are already effectively
    required for the font engine to be useful; the rest are optional extras).
-3. Run `python -m lyrics_sync.main` instead of `python lyrics-sync.py`.
+3. Run `termilyrics` (or `python -m lyrics_sync`) instead of `python lyrics-sync.py`.
 4. Cache layout changed slightly (`~/Lyrics-Sync/lyrics/*.lrc` instead of
    `~/Lyrics-Sync/*.lrc`) — old cached files will simply be re-scraped once;
    nothing needs manual migration.

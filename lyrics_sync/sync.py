@@ -1,20 +1,38 @@
 """SyncEngine: authoritative local playback clock reconciled against playerctl.
 
 Continuous timing never comes straight from playerctl — polling it every
-render tick is both slow (D-Bus round trip) and jittery (player scheduling,
-browser throttling). Instead we run our own monotonic clock, extrapolate
-from the last checkpoint, and only consult playerctl periodically (or on a
-play/pause edge) to correct drift.
+render tick is both slow (a process spawn plus a D-Bus round trip) and
+jittery. Instead we run our own monotonic clock, extrapolate from the last
+checkpoint, and only use playerctl readings to correct it:
+
+  * Every reading carries the monotonic time its position was *sampled*
+    (player.PlayerState.sampled_at), so the time it took to spawn
+    playerctl, identify the song, etc. is never mistaken for playback.
+  * Playback rate is learned, not assumed. A least-squares fit over the
+    last few seconds of readings gives the player's real speed — so a
+    YouTube video at 0.75x (or a player that runs slightly fast) is
+    extrapolated correctly between polls instead of drifting and being
+    yanked back every half second.
+  * Small drift is corrected proportionally and only outside a dead-band
+    sized from the player's own measured noise; large jumps are seeks and
+    snap immediately.
+  * position() never visibly runs backwards for a small correction — it
+    holds still for a moment instead, which matters once individual words
+    are being highlighted.
 """
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Optional
+from typing import Callable, Deque, Optional, Tuple
 
 from .config import SyncConfig
 from .player import PlayerState
+
+_COMMON_RATES = (0.25, 0.5, 0.75, 0.8, 0.85, 0.9, 1.1, 1.15, 1.2, 1.25, 1.5, 1.75, 2.0)
 
 
 class TransportEvent(Enum):
@@ -31,103 +49,198 @@ class SyncSnapshot:
     position: float
     playing: bool
     event: TransportEvent
+    rate: float = 1.0
 
 
 class SyncEngine:
-    def __init__(self, config: SyncConfig):
+    def __init__(self, config: SyncConfig, clock: Callable[[], float] = time.monotonic):
         self.cfg = config
+        self._clock = clock
         self._pos_ref: float = 0.0
-        self._wall_ref: float = time.monotonic()
+        self._wall_ref: float = clock()
         self._playing: bool = False
         self._song_key: Optional[str] = None
-        self._last_poll: float = 0.0
+        self._rate: float = 1.0
+        self._history: Deque[Tuple[float, float]] = deque(maxlen=48)
+        self._noise: Deque[float] = deque(maxlen=12)
+        self._last_sample_at: float = -math.inf
+        self._last_out: Optional[float] = None
 
-        # Effective thresholds actually used by tick() — start at the
-        # configured defaults, but adapt_to_lyrics() can tighten them once
-        # we know how closely-spaced the current song's lyric lines are.
-        # Kept separate from self.cfg so the original config is never
-        # mutated and always available as the "loosest" fallback.
+        # Effective thresholds — start at the configured defaults, but
+        # adapt_to_lyrics() can tighten them once we know how closely
+        # spaced the current song's lines are. Kept separate from self.cfg
+        # so the original config is never mutated.
         self._resync_drift = config.resync_drift_seconds
         self._poll_interval = config.poll_interval_seconds
 
+    # ---- properties ----
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    @property
+    def playing(self) -> bool:
+        return self._playing
+
+    @property
+    def poll_interval(self) -> float:
+        return self._poll_interval
+
     def adapt_to_lyrics(self, min_line_gap: Optional[float]) -> None:
         """Tighten (or reset) drift-correction precision based on how fast
-        the current song's lyrics move.
-
-        For a typical song, the configured defaults are already more than
-        precise enough — but a fast verse with lines 0.3–0.5s apart can have
-        the *default* resync_drift_seconds (0.35s) smooth right past a line
-        boundary, showing the wrong line for a moment. Capping the
-        effective drift threshold (and poll interval, so corrections happen
-        often enough to matter) to a fraction of the smallest real gap
-        between lines fixes that — while never being *looser* than the
-        configured defaults, so slow songs are unaffected.
-
-        Pass None to reset to the configured defaults (e.g. when a new song
-        starts and we don't know its line spacing yet).
-        """
+        the current song's lyrics move. A fast verse with lines 0.3–0.5s
+        apart needs corrections well under that; slow songs are unaffected
+        because this never loosens past the configured defaults. Pass None
+        to reset (new song, spacing unknown)."""
         if min_line_gap is None or min_line_gap <= 0:
             self._resync_drift = self.cfg.resync_drift_seconds
             self._poll_interval = self.cfg.poll_interval_seconds
             return
-        # Floor of 0.05s keeps this sane for pathological/malformed LRC data
-        # with near-duplicate timestamps; cap at the configured default so
-        # this only ever tightens precision, never loosens it.
         self._resync_drift = max(0.05, min(self.cfg.resync_drift_seconds, min_line_gap * 0.3))
         self._poll_interval = max(0.15, min(self.cfg.poll_interval_seconds, min_line_gap * 0.5))
 
-    def _estimate(self) -> float:
+    # ---- clock ----
+
+    def _estimate(self, now: float) -> float:
         if not self._playing:
             return self._pos_ref
-        return self._pos_ref + (time.monotonic() - self._wall_ref)
+        return self._pos_ref + (now - self._wall_ref) * self._rate
+
+    def _anchor(self, position: float, at: float) -> None:
+        self._pos_ref = position
+        self._wall_ref = at
+        self._last_out = None  # a deliberate jump may go backwards
+
+    def position(self, now: Optional[float] = None) -> float:
+        est = self._estimate(self._clock() if now is None else now)
+        if self._playing and self._last_out is not None and 0 < self._last_out - est < 0.3:
+            return self._last_out
+        self._last_out = est
+        return est
+
+    def snapshot(self, now: Optional[float] = None) -> SyncSnapshot:
+        return SyncSnapshot(self.position(now), self._playing, TransportEvent.NONE, self._rate)
+
+    # ---- ground truth ----
 
     def reset(self, song_key: str, state: Optional[PlayerState]) -> SyncSnapshot:
         self._song_key = song_key
-        self._pos_ref = state.position if state else 0.0
-        self._wall_ref = time.monotonic()
-        self._playing = state.playing if state else False
-        self._last_poll = time.monotonic()
-        self.adapt_to_lyrics(None)  # unknown line spacing until lyrics load
-        return SyncSnapshot(self._pos_ref, self._playing, TransportEvent.SONG_CHANGE)
-
-    def tick(self, state: Optional[PlayerState], song_key: Optional[str]) -> SyncSnapshot:
-        now = time.monotonic()
-
-        if state is None:
+        self._history.clear()
+        self._noise.clear()
+        now = self._clock()
+        if state is not None:
+            t = state.sampled_at or now
+            self._anchor(state.position, t)
+            self._playing = state.playing
+            self._last_sample_at = t
+            if state.playing:
+                self._history.append((t, state.position))
+        else:
+            self._anchor(0.0, now)
             self._playing = False
-            return SyncSnapshot(self._estimate(), False, TransportEvent.STOPPED)
+        # The playback rate is a player setting, not a song property — a
+        # YouTube speed setting carries over to the next video — so it is
+        # deliberately kept across songs.
+        self.adapt_to_lyrics(None)
+        return SyncSnapshot(self.position(now), self._playing, TransportEvent.SONG_CHANGE, self._rate)
 
-        if song_key is not None and song_key != self._song_key:
-            return self.reset(song_key, state)
+    def observe(self, state: PlayerState) -> TransportEvent:
+        """Feed one playerctl reading. Returns what it revealed."""
+        t = state.sampled_at or self._clock()
+        if t <= self._last_sample_at:
+            return TransportEvent.NONE  # same reading seen twice: no new information
+        self._last_sample_at = t
 
         if state.playing != self._playing:
-            # Instant pause/play — trusted immediately, not gated by poll cadence,
-            # so pausing/resuming never feels laggy.
-            self._pos_ref = state.position
-            self._wall_ref = now
+            # Play/pause is trusted immediately, never gated by drift logic.
+            self._anchor(state.position, t)
             self._playing = state.playing
-            self._last_poll = now
-            event = TransportEvent.PLAY if state.playing else TransportEvent.PAUSE
-            return SyncSnapshot(self._pos_ref, self._playing, event)
+            self._history.clear()
+            if state.playing:
+                self._history.append((t, state.position))
+            return TransportEvent.PLAY if state.playing else TransportEvent.PAUSE
 
-        event = TransportEvent.NONE
-        if (now - self._last_poll) >= self._poll_interval:
-            estimate = self._estimate()
-            drift = state.position - estimate
-            self._last_poll = now
+        if not self._playing:
+            if abs(state.position - self._pos_ref) > 0.05:
+                self._anchor(state.position, t)  # scrubbing while paused
+                return TransportEvent.SEEK
+            return TransportEvent.NONE
 
-            if abs(drift) > self.cfg.seek_jump_threshold:
-                # Big jump: a real seek/rewind/skip — snap instantly. Always
-                # checked against the *configured* threshold, not the
-                # adaptive one, so a deliberate skip is never mistaken for
-                # drift regardless of how tightly tuned the song is.
-                self._pos_ref = state.position
-                self._wall_ref = now
-                event = TransportEvent.SEEK
-            elif abs(drift) > self._resync_drift:
-                # Small accumulated drift (buffering, clock skew): half-step
-                # correction so the displayed lyric never visibly jumps.
-                self._pos_ref = estimate + drift * 0.5
-                self._wall_ref = now
+        drift = state.position - self._estimate(t)
+        if abs(drift) > self.cfg.seek_jump_threshold:
+            # A real seek/rewind/skip — snap instantly. Checked against the
+            # *configured* threshold, never the adaptive one.
+            self._anchor(state.position, t)
+            self._history.clear()
+            self._noise.clear()
+            self._history.append((t, state.position))
+            return TransportEvent.SEEK
 
-        return SyncSnapshot(self._estimate(), self._playing, event)
+        self._history.append((t, state.position))
+        self._noise.append(drift)
+        self._update_rate()
+
+        drift = state.position - self._estimate(t)
+        if abs(drift) > self._deadband():
+            self._pos_ref = self._estimate(t) + drift * self.cfg.correction_gain
+            self._wall_ref = t
+        return TransportEvent.NONE
+
+    def tick(self, state: Optional[PlayerState], song_key: Optional[str]) -> SyncSnapshot:
+        """Backwards-compatible one-call API: observe + snapshot."""
+        if state is None:
+            self._playing = False
+            return SyncSnapshot(self.position(), False, TransportEvent.STOPPED, self._rate)
+        if song_key is not None and song_key != self._song_key:
+            return self.reset(song_key, state)
+        event = self.observe(state)
+        return replace(self.snapshot(), event=event)
+
+    # ---- internals ----
+
+    def _deadband(self) -> float:
+        """Drift smaller than the player's own reading noise isn't drift.
+        Noise is the *spread* of recent drift readings (median absolute
+        deviation), not their size — a steady offset has no spread and
+        must be corrected, not mistaken for jitter."""
+        if len(self._noise) < 3:
+            return self._resync_drift
+        values = sorted(self._noise)
+        med = values[len(values) // 2]
+        spread = sorted(abs(v - med) for v in values)[len(values) // 2] * 1.4826
+        return max(0.04, min(self._resync_drift, spread * 3.0))
+
+    def _update_rate(self) -> None:
+        if not self.cfg.estimate_rate or len(self._history) < 4:
+            return
+        latest = self._history[-1][0]
+        pts = [(t, p) for t, p in self._history if t >= latest - 8.0]
+        if len(pts) < 4 or pts[-1][0] - pts[0][0] < 2.5:
+            return
+        n = len(pts)
+        mt = sum(t for t, _ in pts) / n
+        mp = sum(p for _, p in pts) / n
+        stt = sum((t - mt) ** 2 for t, _ in pts)
+        if stt <= 0:
+            return
+        slope = sum((t - mt) * (p - mp) for t, p in pts) / stt
+        resid = math.sqrt(sum((p - (mp + slope * (t - mt))) ** 2 for t, p in pts) / n)
+        if resid > 0.12:
+            # Either the speed changed inside the window or the player
+            # reports coarse positions. Forget the older half and retry.
+            for _ in range(len(self._history) // 2):
+                self._history.popleft()
+            return
+        if not 0.25 <= slope <= 4.0:
+            return
+        new = 1.0 if abs(slope - 1.0) < 0.02 else slope
+        for common in _COMMON_RATES:
+            if abs(new - common) < 0.012:
+                new = common
+                break
+        if abs(new - self._rate) > 0.004:
+            # Re-anchor at the latest sample so the change is continuous.
+            self._pos_ref = self._estimate(latest)
+            self._wall_ref = latest
+            self._rate = new

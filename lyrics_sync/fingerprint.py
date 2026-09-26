@@ -16,6 +16,13 @@ Requires two external binaries, neither of which are Python packages:
                whatever's currently playing, via the default monitor source)
   ffmpeg     — used instead of parecord if that's what's available
 
+Slowed / sped-up audio: chromaprint fingerprints are not tempo-invariant,
+so a "slowed + reverb" upload never matches the original recording. When
+ffmpeg is available, a sample that doesn't match as-is is resampled by a
+few typical edit factors (asetrate, which undoes a resample-style edit —
+tempo *and* pitch) and looked up again. The factor that matches tells us
+the track's speed, which the app then uses to re-time the lyrics.
+
 Entirely optional and fails safe at every step: if any dependency is
 missing, if recording fails, if fpcalc fails, or if the network lookup
 fails or times out, `identify()` returns None and the caller keeps
@@ -29,11 +36,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from .detect import Song
@@ -74,7 +84,44 @@ def _fingerprint(path: Path) -> Optional[Tuple[str, int]]:
         return None
 
 
+def _resample(src: Path, dst: Path, factor: float) -> bool:
+    """Play `src` `factor` times faster (tempo and pitch together, i.e.
+    undo a resample-style slowed/sped-up edit) into `dst`."""
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        with wave.open(str(src), "rb") as w:
+            rate = w.getframerate()
+    except (wave.Error, OSError, EOFError):
+        rate = 44100
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+           "-af", f"asetrate={int(rate * factor)},aresample={rate}", str(dst)]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.debug("ffmpeg resample x%.2f failed: %s", factor, e)
+        return False
+    return dst.exists() and dst.stat().st_size > 1000
+
+
+def tempo_attempt_order(factors: Sequence[float], variant: str = "") -> List[float]:
+    """1.0 first, then the correction factors most likely for this track:
+    a slowed track needs speeding up (factor > 1) and vice versa."""
+    rest = [f for f in dict.fromkeys(factors) if f > 0 and abs(f - 1.0) > 1e-6]
+    if variant == "slowed":
+        rest.sort(key=lambda f: (f < 1.0,))
+    elif variant == "sped_up":
+        rest.sort(key=lambda f: (f > 1.0,))
+    return [1.0] + rest
+
+
 def _lookup_acoustid(fingerprint: str, duration: int, api_key: str, timeout: float) -> Optional[Tuple[str, str]]:
+    match = _lookup_acoustid_full(fingerprint, duration, api_key, timeout)
+    return (match[0], match[1]) if match else None
+
+
+def _lookup_acoustid_full(fingerprint: str, duration: int, api_key: str,
+                          timeout: float) -> Optional[Tuple[str, str, Optional[float]]]:
     params = urllib.parse.urlencode({
         "client": api_key,
         "format": "json",
@@ -94,12 +141,25 @@ def _lookup_acoustid(fingerprint: str, duration: int, api_key: str, timeout: flo
         return None
     results = sorted(data.get("results", []), key=lambda r: r.get("score", 0), reverse=True)
     for r in results:
+        if r.get("score", 0) < 0.4:
+            break
         for rec in r.get("recordings") or []:
             title = rec.get("title")
             artists = rec.get("artists") or []
             if title and artists and artists[0].get("name"):
-                return artists[0]["name"], title
+                length = rec.get("duration")
+                return artists[0]["name"], title, float(length) if length else None
     return None
+
+
+@dataclass(frozen=True)
+class AudioMatch:
+    song: "Song"
+    # Length of the matched original recording, if AcoustID knows it.
+    duration: Optional[float]
+    # Speed of what's playing relative to that recording: 0.8 means the
+    # track is a 0.8x slowed edit. 1.0 for a straight match.
+    speed: float = 1.0
 
 
 class AudioIdentifier:
@@ -108,12 +168,14 @@ class AudioIdentifier:
     API key configured, fpcalc installed, a recorder installed) is checked
     once and cached."""
 
-    def __init__(self, api_key: str, sample_seconds: float = 8.0,
-                 lookup_timeout: float = 6.0, tmp_dir: Optional[Path] = None):
+    def __init__(self, api_key: str, sample_seconds: float = 15.0,
+                 lookup_timeout: float = 6.0, tmp_dir: Optional[Path] = None,
+                 tempo_factors: Iterable[float] = ()):
         self.api_key = api_key
         self.sample_seconds = sample_seconds
         self.lookup_timeout = lookup_timeout
         self.tmp_dir = tmp_dir or Path(tempfile.gettempdir())
+        self.tempo_factors = tuple(tempo_factors)
         self._checked = False
         self._available = False
 
@@ -129,27 +191,45 @@ class AudioIdentifier:
                 )
         return self._available
 
-    def identify(self) -> Optional["Song"]:
+    def identify(self, variant: str = "") -> Optional[AudioMatch]:
+        """Record, fingerprint, look up. `variant` ("slowed"/"sped_up", from
+        the title) only reorders which speed corrections are tried first."""
         if not self.available():
             return None
         from .detect import Song  # local import: avoids a module-load-time cycle with detect.py
 
         path = self.tmp_dir / f"lyrics_sync_fp_{os.getpid()}.wav"
+        alt = self.tmp_dir / f"lyrics_sync_fp_{os.getpid()}_tempo.wav"
         try:
             if not _record_sample(path, self.sample_seconds):
                 return None
-            fp = _fingerprint(path)
-            if not fp:
-                return None
-            fingerprint, duration = fp
-            result = _lookup_acoustid(fingerprint, duration, self.api_key, self.lookup_timeout)
-            if not result:
-                return None
-            artist, title = result
-            # A confirmed fingerprint match is strong evidence — high confidence.
-            return Song(artist=artist, title=title, artist_confidence="high")
+            factors = tempo_attempt_order(self.tempo_factors, variant) if shutil.which("ffmpeg") else [1.0]
+            for n, factor in enumerate(factors):
+                src = path
+                if factor != 1.0:
+                    if not _resample(path, alt, factor):
+                        continue
+                    src = alt
+                fp = _fingerprint(src)
+                if not fp:
+                    continue
+                if n:
+                    time.sleep(0.34)  # AcoustID allows 3 requests/second
+                fingerprint, duration = fp
+                result = _lookup_acoustid_full(fingerprint, duration, self.api_key, self.lookup_timeout)
+                if result:
+                    artist, title, length = result
+                    # A confirmed fingerprint match is strong evidence — high confidence.
+                    speed = 1.0 / factor
+                    log.info("fingerprint match at x%.2f correction: %s - %s", factor, artist, title)
+                    song = Song(artist=artist, title=title, artist_confidence="high",
+                                variant="" if factor == 1.0 else ("slowed" if speed < 1 else "sped_up"),
+                                speed_hint=None if factor == 1.0 else round(speed, 3))
+                    return AudioMatch(song=song, duration=length, speed=speed)
+            return None
         finally:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            for p in (path, alt):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
