@@ -224,6 +224,10 @@ class Song:
     # Explicit speed factor when the title states one ("0.8x", "80% speed").
     speed_hint: Optional[float] = None
     album: str = ""
+    # "Lucian Remix", "Remastered 2011", ... — the suffix stripped off the
+    # title for searching. Only used so lyric scoring doesn't penalise
+    # candidates that carry the same tag.
+    version: str = ""
 
     @property
     def key(self) -> str:
@@ -296,13 +300,18 @@ def identify(raw_title: str, raw_artist: str = "", source: str = "", album: str 
     """Best-effort parse of a raw (title, artist) pair into a clean Song,
     including its tempo variant (see detect_variant)."""
     song = _identify(raw_title, raw_artist, source)
+    version = ""
+    if raw_artist:
+        m = _VERSION_SUFFIX.search(_strip_noise(_strip_browser_chrome(raw_title or "")))
+        if m:
+            version = m.group(0).strip(" -–")
     variant, hint = detect_variant(raw_title or "")
     if not variant:
         # Some uploads put the edit tag in the artist/channel field instead.
         variant, hint = detect_variant(raw_artist or "")
-    if variant or album:
+    if variant or album or version:
         song = Song(artist=song.artist, title=song.title, artist_confidence=song.artist_confidence,
-                    variant=variant, speed_hint=hint, album=(album or "").strip())
+                    variant=variant, speed_hint=hint, album=(album or "").strip(), version=version)
     return song
 
 

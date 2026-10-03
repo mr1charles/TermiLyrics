@@ -122,7 +122,7 @@ class AppConfig:
     musicbrainz_enabled: bool = True        # duration lookup only, for re-timing variants
     word_sync_enabled: bool = True          # background upgrade to word-by-word timing
     http_timeout_seconds: float = 8.0
-    user_agent: str = "TermiLyrics/0.1.1 (https://github.com/mr1charles/TermiLyrics)"
+    user_agent: str = "TermiLyrics/0.1.2 (https://github.com/mr1charles/TermiLyrics)"
 
     # Slowed / sped-up / nightcore uploads: stretch the original lyric
     # timestamps to the track's real speed. See timing.variant_scale().

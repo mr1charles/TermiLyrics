@@ -149,7 +149,12 @@ def romanize(text: str) -> RomanizeResult:
             log.debug("korean_romanizer failed for %r: %s", text, e)
             return RomanizeResult(text, False, script, backend_available=True)
 
-    if script in ("cyrillic", "greek", "arabic", "hebrew", "devanagari"):
+    if script in ("arabic", "hebrew"):
+        # Unidecode drops the vowels of these abjads ("ylHqh mn byt lbyt"),
+        # which is unreadable; the terminal renders the native script fine.
+        return RomanizeResult(text, False, script, backend_available=False)
+
+    if script in ("cyrillic", "greek", "devanagari"):
         if not HAVE_UNIDECODE:
             return RomanizeResult(text, False, script, backend_available=False)
         try:

@@ -391,13 +391,24 @@ def _default_http_get(user_agent: str, timeout: float) -> HttpGet:
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
         req = urllib.request.Request(f"{url}?{query}" if query else url,
                                      headers={"User-Agent": user_agent, "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            raise
+        # LrcLib answers 503/429 under load; one blip must not make the app
+        # fall back to a different provider's (often different) version.
+        last: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return None
+                if e.code not in (429, 500, 502, 503, 504):
+                    raise
+                last = e
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last = e
+            time.sleep(0.6 * (attempt + 1))
+        assert last is not None
+        raise last
     return get
 
 
@@ -434,6 +445,10 @@ def score_candidates(candidates: Sequence[Dict[str, Any]], song: Song,
             continue
         title = c.get("trackName") or c.get("name") or ""
         t_sim = similarity(title, song.title)
+        if song.version:
+            # "Trndsttr (Lucian Remix)" is the right upload for a playing
+            # "Trndsttr - Lucian Remix": compare against the tagged title too.
+            t_sim = max(t_sim, similarity(title, f"{song.title} {song.version}"))
         parts = [(0.55, t_sim)]
         if use_artist:
             parts.append((0.30, similarity(c.get("artistName") or "", song.artist)))
@@ -447,7 +462,12 @@ def score_candidates(candidates: Sequence[Dict[str, Any]], song: Song,
         if d is not None:
             parts.append((0.20, d))
         total = sum(w * s for w, s in parts) / sum(w for w, _ in parts)
-        total -= _version_penalty(title, song.title)
+        total -= _version_penalty(title, f"{song.title} {song.version}")
+        if d == 0.0:
+            # 25s+ off the playing track's length: a different recording
+            # (e.g. the 4-min original for a 3-min remix). Rank it below any
+            # candidate that actually fits, even a mislabelled one.
+            total *= 0.6
         scored.append(_Scored(c, total, t_sim))
     scored.sort(key=lambda s: s.score, reverse=True)
     return scored
@@ -457,8 +477,45 @@ def score_candidates(candidates: Sequence[Dict[str, Any]], song: Song,
 # Service
 # --------------------------------------------------------------------------
 
+_PENDING_RETRY_SECONDS = 120          # retry LrcLib this soon after it failed
 _MISSING_TTL_SECONDS = 12 * 3600       # don't re-scrape a known-missing song for this long
 _WORDS_RECHECK_SECONDS = 3 * 24 * 3600  # ...or re-ask Musixmatch for word timing
+
+
+def _first_timestamp(candidate: Dict[str, Any]) -> Optional[float]:
+    m = re.search(r"\[(\d+):(\d+(?:\.\d+)?)\][ \t]*\S", candidate.get("syncedLyrics") or "")
+    return int(m.group(1)) * 60 + float(m.group(2)) if m else None
+
+
+def consensus_pick(ranked: List["_Scored"], expected: Optional[float]) -> List["_Scored"]:
+    """LrcLib holds many uploads of the same song, some timed for a different
+    edit (the original's long intro on a radio edit, ...) yet labelled with the
+    right length, so title/artist/duration alone can tie them. Among the
+    near-top candidates that fit the track length, prefer the timing most of
+    the others agree on."""
+    if len(ranked) < 3:
+        return ranked
+    top = ranked[0].score
+    pool = [s for s in ranked if s.score >= top - 0.25 and s.title_sim >= 0.55
+            and (s.candidate.get("syncedLyrics") or "").strip()]
+    if expected:
+        fit = [s for s in pool if s.candidate.get("duration")
+               and abs(float(s.candidate["duration"]) - expected) <= max(3.0, 0.015 * expected)]
+        pool = fit or pool
+    firsts = [(s, _first_timestamp(s.candidate)) for s in pool]
+    firsts = [(s, t) for s, t in firsts if t is not None]
+    if len(firsts) < 3:
+        return ranked
+
+    def support(t: float) -> int:
+        return sum(1 for _, u in firsts if abs(u - t) <= 1.0)
+
+    best_support = max(support(t) for _, t in firsts)
+    current_support = support(firsts[0][1]) if firsts[0][0] is ranked[0] else 0
+    if best_support < 2 or best_support <= current_support:
+        return ranked
+    pick = next(s for s, t in firsts if support(t) == best_support)   # highest-scored of the largest cluster
+    return [pick] + [s for s in ranked if s is not pick]
 
 
 class LyricsService:
@@ -523,12 +580,14 @@ class LyricsService:
         expected = self._expected_original_length(song, player_length)
         result: Optional[LyricsResult] = None
         lrclib_answered = False
+        lrclib_failed = False
         if self.lrclib is not None:
             try:
                 result = self._from_lrclib(song, player_length, expected)
                 lrclib_answered = True
             except Exception as e:  # network/provider failure: fall through to syncedlyrics
                 log.info("LrcLib lookup failed for %r: %s", song, e)
+                lrclib_failed = True
 
         if (result is None or not result.lines) and not (result is not None and result.instrumental):
             text = self._scrape(song, expected) if HAVE_SYNCEDLYRICS else ""
@@ -537,8 +596,11 @@ class LyricsService:
                 if doc.lines:
                     result = LyricsResult(lines=doc.lines, source="syncedlyrics", duration=doc.length)
                     self.cache.write(key, text)
+                    # If LrcLib was only unreachable, this is a stopgap: re-ask
+                    # it next time (see _from_cache) instead of keeping a
+                    # possibly different version forever.
                     self._write_meta(key, source="syncedlyrics", duration=doc.length, missing=None,
-                                     fetched=time.time())
+                                     fetched=time.time(), lrclib_pending=lrclib_failed or None)
                     self._sync_caelestia(song, text)
 
         if result is None:
@@ -614,6 +676,9 @@ class LyricsService:
         text = self.cache.read(key)
         if text is None:
             return None
+        pending = meta.get("lrclib_pending")
+        if pending and self.lrclib is not None and time.time() - float(meta.get("fetched") or 0) > _PENDING_RETRY_SECONDS:
+            return None   # stopgap from a failed LrcLib lookup — try LrcLib again
         doc = parse_lrc_document(text)
         if not doc.lines:
             return None
@@ -672,6 +737,13 @@ class LyricsService:
                     break
         if best is None:
             return None
+        ranked = score_candidates(list(seen.values()), song, expected)
+        if song.variant and player_length:
+            ranked = self._prefer_exact_variant(ranked, song, player_length)
+        else:
+            ranked = consensus_pick(ranked, expected or player_length)
+        if ranked and ranked[0].title_sim >= 0.55 and ranked[0].score >= 0.5:
+            best = ranked[0]
         c = best.candidate
         synced = (c.get("syncedLyrics") or "").strip()
         duration = float(c["duration"]) if c.get("duration") else None
@@ -683,7 +755,8 @@ class LyricsService:
             return None
         self.cache.write(song.key, synced)
         self._write_meta(song.key, source="lrclib", duration=duration, missing=None, fetched=time.time(),
-                         title=c.get("trackName", ""), artist=c.get("artistName", ""), lrclib_id=c.get("id"))
+                         title=c.get("trackName", ""), artist=c.get("artistName", ""), lrclib_id=c.get("id"),
+                         lrclib_pending=None)
         self._sync_caelestia(song, synced)
         return LyricsResult(lines=doc.lines, source="lrclib", duration=duration,
                             matched_title=c.get("trackName", ""), matched_artist=c.get("artistName", ""))

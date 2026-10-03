@@ -188,3 +188,79 @@ def test_only_one_word_timing_lookup_in_flight(tmp_path, monkeypatch):
     monkeypatch.setattr(lyrics_mod, "syncedlyrics", Boom, raising=False)
     assert svc.fetch_word_timing(identify("Song", "Artist"), parse_lrc(LRC_A)) is None
     svc._words_lock.release()
+
+
+def _lrc(first):
+    return f"[{int(first // 60):02d}:{first % 60:05.2f}]Line one\n[00:30.00]Line two"
+
+
+def test_consensus_prefers_the_timing_most_uploads_agree_on(tmp_path):
+    # Two mislabelled uploads carry the original's long intro; four agree on
+    # the remix's timing. All fit the track length equally well.
+    http = FakeHttp(lrclib=[
+        cand(1, "Trndsttr", "Black Coast", 180, _lrc(25.89)),
+        cand(2, "Trndsttr", "Black Coast", 180, _lrc(25.89)),
+        cand(3, "Trndsttr", "Black Coast", 179, _lrc(0.53)),
+        cand(4, "Trndsttr", "Black Coast", 180, _lrc(0.56)),
+        cand(5, "Trndsttr", "Black Coast", 180, _lrc(0.58)),
+        cand(6, "Trndsttr", "Black Coast", 179, _lrc(0.58)),
+    ])
+    song = identify("Trndsttr (feat. M. Maggie) - Lucian Remix", "Black Coast", "spotify")
+    assert song.version == "Lucian Remix"
+    res = service(tmp_path, http).fetch(song, player_length=179.7)
+    assert res.lines[0].timestamp < 1.0
+
+
+def test_far_off_duration_is_penalised():
+    song = identify("Song", "Artist", "spotify")
+    ranked = score_candidates([cand(1, "Song", "Artist", 244), cand(2, "Song", "Artist", 180)], song, 180)
+    assert ranked[0].candidate["id"] == 2
+    assert ranked[0].score - ranked[1].score > 0.3
+
+
+def test_remix_tag_in_the_playing_title_is_not_penalised():
+    song = identify("Trndsttr - Lucian Remix", "Black Coast", "spotify")
+    ranked = score_candidates([cand(1, "Trndsttr (Lucian Remix)", "Black Coast", 180)], song, 180)
+    assert ranked[0].score > 0.95
+
+
+def test_lrclib_http_get_retries_transient_errors(monkeypatch):
+    import io
+    import urllib.error
+    calls = {"n": 0}
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(req.full_url, 503, "Service Unavailable", {}, None)
+        return Resp(b"[]")
+
+    monkeypatch.setattr(lyrics_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(lyrics_mod.time, "sleep", lambda s: None)
+    get = lyrics_mod._default_http_get("ua", 5)
+    assert get("https://lrclib.net/api/search", {"q": "x"}) == []
+    assert calls["n"] == 3
+
+
+def test_fallback_result_after_lrclib_failure_is_retried_later(tmp_path, monkeypatch):
+    monkeypatch.setattr(lyrics_mod, "HAVE_SYNCEDLYRICS", True)
+    monkeypatch.setattr(lyrics_mod.syncedlyrics, "search", lambda *a, **k: LRC_A, raising=False)
+
+    class Down:
+        def __call__(self, url, params):
+            raise OSError("lrclib unreachable")
+
+    svc = service(tmp_path, Down())
+    song = identify("Song", "Artist", "spotify")
+    first = svc.fetch(song, player_length=30)
+    assert first.source == "syncedlyrics"
+    # Fresh cache entry from a failed LrcLib lookup is only a stopgap: once the
+    # retry window passes it must not be served as the final answer.
+    meta = svc._read_meta(song.key)
+    assert meta.get("lrclib_pending") is True
+    svc._write_meta(song.key, fetched=0)
+    assert svc._from_cache(song.key, svc._read_meta(song.key)) is None

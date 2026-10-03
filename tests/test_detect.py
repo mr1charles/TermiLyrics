@@ -68,3 +68,10 @@ def test_spotify_ad_detected_by_url():
     assert is_advertisement("Listen to music, ad-free.", "", "https://open.spotify.com/ad/abc")
     assert not is_advertisement("Mandem Style", "Luke Day", "https://open.spotify.com/track/5hKQHXGzM8pxLeestSXu32")
     assert not is_advertisement("LISTEN NOW", "Some Band", "")
+
+
+def test_arabic_and_hebrew_are_left_in_native_script():
+    from lyrics_sync.languages import romanize
+    for text in ("يلحقها من بيت لبيت ويقلها اعطيني بوسة", "שלום עולם"):
+        r = romanize(text)
+        assert not r.was_romanized and r.text == text
