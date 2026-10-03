@@ -403,7 +403,7 @@ class LyricsApp:
                 continue
             self.player_missing = False
 
-            if is_advertisement(state.title, state.artist):
+            if is_advertisement(state.title, state.artist, state.url):
                 # Don't touch the song or sync at all — when the ad ends,
                 # the real song resumes exactly where we left it.
                 self.ad_playing = True

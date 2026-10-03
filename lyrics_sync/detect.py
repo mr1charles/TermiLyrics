@@ -90,7 +90,7 @@ def _looks_like_uploader(name: str) -> bool:
     return any(kw in compact for kw in _UPLOADER_KEYWORDS)
 
 
-def is_advertisement(raw_title: str, raw_artist: str) -> bool:
+def is_advertisement(raw_title: str, raw_artist: str, url: str = "") -> bool:
     """Best-effort detection of an ad break, e.g. Spotify's free-tier ads
     (which typically report artist/title as literally "Spotify"/"Advertisement").
     Deliberately conservative — only matches specific, low-false-positive
@@ -98,6 +98,11 @@ def is_advertisement(raw_title: str, raw_artist: str) -> bool:
     song's lyrics entirely."""
     t = (raw_title or "").strip().lower()
     a = (raw_artist or "").strip().lower()
+    # Spotify's free-tier ads carry an ad URL (open.spotify.com/ad/<id>) and
+    # an empty artist, with arbitrary slogans as the title ("LISTEN NOW"),
+    # so the URL is the one reliable signal.
+    if "spotify.com/ad/" in (url or "").lower() or "spotify:ad:" in (url or "").lower():
+        return True
     if "advertisement" in t or "advertisement" in a:
         return True
     if a == "spotify" and (not t or t == "spotify" or t == "advertisement"):

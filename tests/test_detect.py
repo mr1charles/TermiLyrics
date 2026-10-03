@@ -60,3 +60,11 @@ def test_remaster_suffix_is_not_the_title():
 def test_super_slowed_suffix_keeps_real_title():
     s = identify("VANITY FUNK - SUPER SLOWED", "NTRXBRST", "spotify")
     assert (s.artist, s.title) == ("NTRXBRST", "VANITY FUNK")
+
+
+def test_spotify_ad_detected_by_url():
+    from lyrics_sync.detect import is_advertisement
+    assert is_advertisement("LISTEN NOW", "", "https://open.spotify.com/ad/c37fef509707421984bca5807fe40561")
+    assert is_advertisement("Listen to music, ad-free.", "", "https://open.spotify.com/ad/abc")
+    assert not is_advertisement("Mandem Style", "Luke Day", "https://open.spotify.com/track/5hKQHXGzM8pxLeestSXu32")
+    assert not is_advertisement("LISTEN NOW", "Some Band", "")
