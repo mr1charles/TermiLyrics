@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .canvas import Canvas, Style, char_width, style, text_width, truncate
 from .config import RenderConfig
+from .effects import ArtistFx, beat_level, paint_effect
 from .fonts import SIZE_BIG, SIZE_MEDIUM, FontEngine
 from .languages import detect_script, romanize as _romanize
 from .lyrics import Word
@@ -125,6 +126,7 @@ class LiveRenderState:
     text_style: str = TEXT_STYLE_AUTO
     animation: str = ANIM_FADE
     status_bar: bool = True
+    effects: bool = True          # artist effects (stage lights, confetti)
     version: int = 0
 
     @classmethod
@@ -175,9 +177,14 @@ class LiveRenderState:
         self.status_bar = not self.status_bar
         self._changed()
 
+    def toggle_effects(self) -> None:
+        self.effects = not self.effects
+        self._changed()
+
     def to_dict(self) -> Dict[str, object]:
         return {"theme": self.theme, "display_mode": self.display_mode, "romanize": self.romanize,
-                "text_style": self.text_style, "animation": self.animation, "status_bar": self.status_bar}
+                "text_style": self.text_style, "animation": self.animation, "status_bar": self.status_bar,
+                "effects": self.effects}
 
     def apply_dict(self, data: Dict[str, object]) -> None:
         if data.get("theme") in THEMES:
@@ -192,6 +199,8 @@ class LiveRenderState:
             self.romanize = bool(data["romanize"])
         if isinstance(data.get("status_bar"), bool):
             self.status_bar = bool(data["status_bar"])
+        if isinstance(data.get("effects"), bool):
+            self.effects = bool(data["effects"])
         self._changed()
 
 
@@ -228,6 +237,8 @@ class Scene:
     toast: str = ""
     show_help: bool = False
     help_lines: List[Tuple[str, str]] = field(default_factory=list)
+    fx: Optional[ArtistFx] = None                 # artist effect for the playing track
+    beats: Tuple[Tuple[float, float], ...] = ()   # recent (monotonic time, strength) beats
 
 
 @dataclass
@@ -319,10 +330,15 @@ class Renderer:
         self._sheet_cache: "weakref.WeakKeyDictionary[LyricTimeline, Dict[Tuple[int, bool], tuple]]" = \
             weakref.WeakKeyDictionary()
         self._animating = False
+        self._fx: Optional[ArtistFx] = None     # active artist effect (set per frame in render())
+        self._pulse = 0.0                       # 0..1 beat flash level for the text
         self._scene = Scene()
 
     @property
     def _theme(self) -> ColorTheme:
+        fx = getattr(self, "_fx", None)
+        if fx is not None:
+            return fx.theme
         return THEMES.get(self.live.theme, DEFAULT_THEME)
 
     # ---- text preparation ----
@@ -435,9 +451,10 @@ class Renderer:
         if self.cfg.rainbow or th.animated:
             shift = self._scene.now * 0.08 if th.animated else 0.0
             return hue(col_frac * 0.85 + shift)
-        if self.cfg.gradient:
-            return lerp(th.primary, th.secondary, row_frac)
-        return th.primary
+        base = lerp(th.primary, th.secondary, row_frac) if self.cfg.gradient else th.primary
+        if self._pulse > 0.02:       # artist effect: text brightens on the beat
+            return lerp(base, th.highlight, self._pulse * 0.6)
+        return base
 
     def _unsung(self) -> Tuple[int, int, int]:
         th = self._theme
@@ -549,6 +566,9 @@ class Renderer:
     def render(self, scene: Scene, cols: int, rows: int) -> Frame:
         self._scene = scene
         self._animating = False
+        self._fx = scene.fx if (self.live.effects and scene.fx is not None
+                                and self.live.display_mode != DISPLAY_HACKER_MATRIX) else None
+        self._pulse = beat_level(scene.beats, scene.now) if self._fx is not None else 0.0
         canvas = Canvas(cols, rows)
         if cols <= 0 or rows <= 0:
             return Frame([], False)
@@ -565,6 +585,11 @@ class Renderer:
             area = self._paint_box_frame(canvas, area, scene)
         elif mode == DISPLAY_HACKER_MATRIX:
             self._paint_rain(canvas, area, scene)
+
+        if self._fx is not None:
+            # Behind the lyrics: text painters only overwrite the cells they use.
+            paint_effect(canvas, area.x, area.y, area.w, area.h, self._fx, scene.now, scene.beats)
+            self._animating = True
 
         target = canvas
         layer: Optional[Canvas] = None
@@ -618,6 +643,7 @@ class Renderer:
             ("a", f"text size      {live.text_style}"),
             ("r", f"romanize       {'on' if live.romanize else 'off'}"),
             ("p", f"status bar     {'on' if live.status_bar else 'off'}"),
+            ("x", f"artist effects {'on' if live.effects else 'off'}   (stage lights / confetti on the beat)"),
         ]
         lines.extend(extra)
         return lines

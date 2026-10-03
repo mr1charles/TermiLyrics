@@ -22,6 +22,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -30,6 +31,7 @@ from .ai import OllamaSongIdentifier
 from .cache import JsonCache
 from .config import AppConfig
 from .detect import Song, identify, is_advertisement
+from .effects import ARTIST_FX, BeatTracker, ArtistFx, fx_for_artist, load_user_fx
 from .fingerprint import AudioIdentifier
 from .fonts import AccentStrippingFont, FontEngine, RasterUnicodeFont, StaticBlockFont
 from .keyboard import (BACKSPACE_KEYS, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_SHIFT_TAB, TAB_KEY,
@@ -139,6 +141,14 @@ class LyricsApp:
                                       height=config.render.font_height)
 
         self.settings_store = SettingsStore(config.paths.settings_file)
+        # Artist effects (stage lights...) — see effects.py. The tracker only
+        # starts listening to system audio once a track with an effect plays.
+        self.user_fx = load_user_fx(config.paths.home / "artist_fx.json")
+        self.fx_override: Optional[ArtistFx] = None     # --fx NAME
+        self.beat_tracker = BeatTracker()
+        self._line_beats: deque = deque(maxlen=8)       # fallback pulses on lyric line changes
+        self._last_line = -1
+        self._fx_last_seen = 0.0
         self.live = LiveRenderState.from_config(config.render)
         self.renderer = Renderer(self.font_engine, config.render, live=self.live)
         self.adjustments = AdjustmentStore(config.paths.adjustments_file)
@@ -497,6 +507,9 @@ class LyricsApp:
             self.toast(f"Romanize: {'on' if live.romanize else 'off'}")
         elif key == "p":
             live.toggle_status_bar()
+        elif key == "x":
+            live.toggle_effects()
+            self.toast(f"Artist effects: {'on' if live.effects else 'off'}")
         else:
             changed = False
         if changed:
@@ -569,6 +582,23 @@ class LyricsApp:
                           offset=tm.offset, word_sync=self.lyrics.has_word_timing,
                           player_rate=self.sync.rate, source=self.lyrics.source)
 
+    def _effect_state(self, now: float, song: Optional[Song]) -> Tuple[Optional[ArtistFx], tuple]:
+        """Which artist effect applies right now, and the beats to drive it."""
+        fx = None
+        if self.live.effects:
+            fx = self.fx_override or (fx_for_artist(song.artist, self.user_fx) if song else None)
+        if fx is None:
+            if self.beat_tracker.available is not None and now - self._fx_last_seen > 20.0:
+                self.beat_tracker.stop()        # nothing needs the audio any more
+                self.beat_tracker = BeatTracker(offset=self.beat_tracker.offset)
+            return None, ()
+        self._fx_last_seen = now
+        self.beat_tracker.start()
+        # Real beats when system audio is audible; otherwise pulse on lyric lines.
+        if self.beat_tracker.available and now - self.beat_tracker.last_audio_at < 2.5:
+            return fx, self.beat_tracker.beats()
+        return fx, tuple(self._line_beats)
+
     def build_scene(self, now: float) -> Scene:
         toast = self._toast if now < self._toast_until else ""
         if self._help_visible and now > self._help_until:
@@ -577,6 +607,8 @@ class LyricsApp:
         base = dict(now=now, toast=toast, show_help=self._help_visible, help_lines=help_lines)
         song = self.current_song
         title = song.title if song else ""
+        fx, beats = self._effect_state(now, song)
+        base.update(fx=fx, beats=beats)
 
         if self.player_missing:
             if shutil.which("playerctl") is None and isinstance(self.player, PlayerSource):
@@ -586,9 +618,9 @@ class LyricsApp:
             else:
                 detail = ("Play something in Spotify, a browser (YouTube), mpv, VLC…\n"
                           "anything playerctl can see.   Or try:  termilyrics --demo")
-            return Scene(message="No music player detected", message_detail=detail, **base)
+            return Scene(message="No music player detected", message_detail=detail, **{**base, "fx": None})
         if self.ad_playing:
-            return Scene(message="Advertisement — lyrics paused", **base)
+            return Scene(message="Advertisement — lyrics paused", **{**base, "fx": None})
 
         snap = self.sync.snapshot(now)
         status = self._status(snap.position)
@@ -605,6 +637,10 @@ class LyricsApp:
 
         tm = self.tempo_map()
         cursor = self.timeline.locate(tm.to_lyric(snap.position))
+        if cursor.index != self._last_line:
+            self._last_line = cursor.index
+            if cursor.index >= 0:
+                self._line_beats.append((now, 0.8))     # fallback "beat" when no audio capture
         return Scene(cursor=cursor, timeline=self.timeline, scale=tm.scale * self.sync.rate,
                      status=status, **base)
 
@@ -649,6 +685,7 @@ class LyricsApp:
                 await self.render_loop(terminal, keyboard)
             finally:
                 self._running = False
+                self.beat_tracker.stop()
                 watcher.cancel()
                 for t in self._background:
                     t.cancel()
@@ -701,6 +738,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fps", type=int, help="animation frame rate (default 30)")
     p.add_argument("--no-status", action="store_true", help="hide the bottom status bar")
     p.add_argument("--no-romanize", action="store_true", help="show non-Latin lyrics in their own script")
+    p.add_argument("--fx", metavar="ARTIST",
+                   help="force an artist's effect for every song, e.g. --fx blackpink (see --list)")
+    p.add_argument("--no-fx", action="store_true", help="turn artist effects (stage lights etc.) off")
+    p.add_argument("--beat-offset", type=float, default=0.0, metavar="SECONDS",
+                   help="shift the beat flashes later (+) or earlier (-), e.g. for Bluetooth audio lag")
     p.add_argument("--player", action="append", metavar="NAME",
                    help="prefer this player (e.g. spotify, firefox, mpv); repeatable")
     p.add_argument("--demo", nargs="?", const="", metavar="LRC_FILE",
@@ -731,6 +773,9 @@ def _print_list() -> None:
     print("     " + ", ".join(ANIMATIONS))
     print("\nText sizes (a):")
     print("     " + ", ".join(TEXT_STYLES))
+    print("\nArtist effects (x to toggle; add your own in ~/Lyrics-Sync/artist_fx.json):")
+    names = sorted({f"{f.name} ({f.effect})" for f in ARTIST_FX.values()})
+    print("     " + ", ".join(names))
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -796,8 +841,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         overrides["status_bar"] = False
     if args.no_romanize:
         overrides["romanize"] = False
+    if args.no_fx:
+        overrides["effects"] = False
     if overrides:
         app.live.apply_dict(overrides)
+    app.beat_tracker.offset = args.beat_offset
+    if args.fx:
+        forced = fx_for_artist(args.fx, app.user_fx)
+        if forced is None:
+            parser.error(f"no effect for {args.fx!r} — see --list")
+        app.fx_override = forced
 
     try:
         asyncio.run(app.run())

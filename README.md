@@ -186,6 +186,23 @@ Whether you're coding, studying, or just vibing with music, your terminal become
 
 ---
 
+# 🎆 Artist effects
+
+Some artists get their own show. When a track by **BLACKPINK** (or Jennie, Jisoo, Rosé, Lisa) plays, the screen turns into a pink **stage**: moving-head spotlights sweep from the ceiling, the floor glows, and **on every kick drum the lights flare, sparkles pop and the lyrics flash brighter**. Other groups get their own colors — BTS, TWICE, NCT / NCT WISH, Stray Kids, aespa, ITZY, NewJeans, LE SSERAFIM, IVE, (G)I-DLE, EXO, SEVENTEEN, Red Velvet, TXT, ENHYPEN, ATEEZ, MAMAMOO, BIGBANG, Girls' Generation — and Coldplay gets rainbow **confetti** bursts. Run `termilyrics --list` to see all of them.
+
+- **How it hears the beat:** it listens to your system's audio output (the "monitor" of the default sink, through `parec` — present on PulseAudio and PipeWire) and detects kick drums with a small built-in detector. Audio is analysed in memory and never recorded or sent anywhere. If capture isn't possible it pulses on each lyric line instead.
+- `x` toggles effects while running; `--no-fx` starts with them off; `--fx blackpink` forces an artist's effect on every song (handy for trying it out: `termilyrics --demo --fx blackpink`).
+- Bluetooth speakers lag behind: nudge the flashes later with `--beat-offset 0.15`.
+- Add your own artists in `~/Lyrics-Sync/artist_fx.json`:
+  ```json
+  {"Daft Punk": {"effect": "stage_lights", "colors": ["#00e5ff", "#ff2bd6"]},
+   "Halsey":    {"effect": "confetti",     "colors": ["#ff00ff", "#00ffff"]}}
+  ```
+  Effects: `stage_lights`, `confetti`. Colors are the beam/confetti colors, brightest first.
+- Flashes are rate-limited to about 3 a second and use soft colors, never full-screen white — but if you're sensitive to flashing lights, press `x` or use `--no-fx`.
+
+---
+
 # 🛣️ Roadmap
 
 Coming soon:

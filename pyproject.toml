@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "termilyrics"
-version = "0.1.2"
+version = "0.2.0"
 description = "Synced, animated lyrics in your terminal — karaoke sing-along mode, word-by-word timing, slowed/sped-up track support."
 readme = "README.md"
 requires-python = ">=3.9"
