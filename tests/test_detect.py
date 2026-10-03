@@ -45,3 +45,18 @@ def test_existing_title_parsing_still_works():
     assert (s.artist, s.title) == ("Enjambre", "Cuéntame")
     s = identify("7clouds - Artist - Song (Lyrics) - Mozilla Firefox", "")
     assert (s.artist, s.title) == ("Artist", "Song")
+
+
+def test_remix_suffix_is_not_the_title():
+    s = identify("Trndsttr (feat. M. Maggie) - Lucian Remix", "Black Coast", "spotify")
+    assert (s.artist, s.title) == ("Black Coast", "Trndsttr")
+
+
+def test_remaster_suffix_is_not_the_title():
+    s = identify("Hello - Remastered 2011", "Adele", "spotify")
+    assert (s.artist, s.title) == ("Adele", "Hello")
+
+
+def test_super_slowed_suffix_keeps_real_title():
+    s = identify("VANITY FUNK - SUPER SLOWED", "NTRXBRST", "spotify")
+    assert (s.artist, s.title) == ("NTRXBRST", "VANITY FUNK")

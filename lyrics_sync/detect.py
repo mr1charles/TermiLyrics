@@ -59,6 +59,11 @@ _FEAT_TAGS = [
     r"\(feat\..*?\)", r"\(ft\..*?\)", r"\(with\s.*?\)", r"\[feat\..*?\]",
     r"\(con\s.*?\)",  # Spanish "featuring"
 ]
+# Spotify appends "- <Name> Remix", "- Radio Edit", "- Remastered 2011" etc. to
+# the title. Left in, the " - " split treats that suffix as the song title.
+_VERSION_SUFFIX = re.compile(
+    r"\s[-–]\s(?:\S+\s+){0,3}?(?:remix|edit|mix|vip|flip|bootleg|rework|version|remaster(?:ed)?|"
+    r"live|acoustic|instrumental)(?:\s+(?:version|\d{4}))*\s*$", re.I)
 _KNOWN_LYRIC_UPLOADERS = {"7clouds", "lyrics", "ilyricsclub", "vevo", "topic"}
 
 # Generalizes _KNOWN_LYRIC_UPLOADERS into a pattern: most lyric/music/genre
@@ -302,6 +307,10 @@ def _identify(raw_title: str, raw_artist: str = "", source: str = "") -> Song:
     ordering; the parser degrades gracefully without it.
     """
     title = _strip_translation_suffix(_strip_noise(_strip_browser_chrome(raw_title or "")))
+    if raw_artist:
+        # Only with a real artist field: a lone "A - B Remix" with no artist
+        # is still ambiguous, so keep the old behaviour there.
+        title = _VERSION_SUFFIX.sub("", title).strip() or title
     artist, artist_field_confidence = _resolve_artist_field(raw_artist or "")
 
     # Player already gives a (now-cleaned) artist field and the title has no

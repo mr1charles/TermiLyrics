@@ -62,6 +62,14 @@ cd TermiLyrics
 pip install .                     # or: pipx install .
 ```
 
+Or use the one-step installer (private virtualenv, no root needed):
+
+```bash
+./install.sh
+```
+
+Either way you can start it with any of **`termilyrics`**, **`tlyrics`** or **`lyrics`**.
+
 Optional extras:
 
 ```bash
